@@ -1,0 +1,11 @@
+id: no-scattered-cimport
+message: "禁止在业务模块中分散调用 @cImport。所有 C 头文件必须收口到 src/c/c_deps.h 并通过 @import(\"c\") 访问。"
+severity: error
+language: Zig
+files:
+  - "src/**"
+rule:
+  kind: builtin_function
+  has:
+    kind: builtin_identifier
+    regex: "^@cImport$"

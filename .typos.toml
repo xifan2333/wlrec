@@ -1,0 +1,19 @@
+[files]
+extend-exclude = [
+  ".zig-cache",
+  "zig-out",
+]
+
+[default.extend-words]
+# Wayland / DRM / FFmpeg / Zig abbreviations
+pixfmt = "pixfmt"
+fourcc = "fourcc"
+dmabuf = "dmabuf"
+vaapi = "vaapi"
+libva = "libva"
+libdrm = "libdrm"
+errdefer = "errdefer"
+comptime = "comptime"
+callconv = "callconv"
+anyopaque = "anyopaque"
+wlrec = "wlrec"

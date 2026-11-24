@@ -1,0 +1,25 @@
+id: deep-if-branching
+message: "代码块内分支嵌套过深 (>= 4 层)。请优先使用卫语句（early return / errdefer）或拆分独立函数保持扁平控制流。"
+severity: warning
+language: Zig
+files:
+  - "src/**"
+rule:
+  any:
+    - kind: if_statement
+    - kind: if_expression
+  inside:
+    stopBy: end
+    any:
+      - kind: if_statement
+      - kind: if_expression
+    inside:
+      stopBy: end
+      any:
+        - kind: if_statement
+        - kind: if_expression
+      inside:
+        stopBy: end
+        any:
+          - kind: if_statement
+          - kind: if_expression

@@ -1,0 +1,19 @@
+id: deep-if-branching
+valid:
+  - |
+    fn ok(a: bool, b: bool, c: bool) void {
+      if (!a) return;
+      if (!b) return;
+      if (c) {}
+    }
+invalid:
+  - |
+    fn bad(a: bool, b: bool, c: bool, d: bool) void {
+      if (a) {
+        if (b) {
+          if (c) {
+            if (d) {}
+          }
+        }
+      }
+    }

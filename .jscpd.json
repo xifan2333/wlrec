@@ -1,0 +1,9 @@
+{
+  "threshold": 3.0,
+  "minTokens": 70,
+  "minLines": 6,
+  "reporters": ["console"],
+  "path": ["src"],
+  "ignore": ["**/.zig-cache/**", "**/zig-out/**", "**/tests/**", "**/*.json"],
+  "format": ["zig", "c", "c-header"]
+}

@@ -1,0 +1,6 @@
+id: no-debug-print
+valid:
+  - "std.log.info(\"ok\", .{});"
+  - "try stdout.print(\"ok\\n\", .{});"
+invalid:
+  - "fn f() void { std.debug.print(\"debug\\n\", .{}); }"

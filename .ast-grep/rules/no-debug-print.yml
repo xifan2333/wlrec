@@ -1,0 +1,11 @@
+id: no-debug-print
+message: "禁止在正式源码中遗留 std.debug.print。请使用结构化日志或显式 Io.Writer。"
+severity: error
+language: Zig
+files:
+  - "src/**"
+rule:
+  kind: call_expression
+  has:
+    kind: field_expression
+    regex: "^std\\.debug\\.print$"

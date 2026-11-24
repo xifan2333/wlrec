@@ -1,0 +1,8 @@
+id: no-silent-catch
+valid:
+  - "const x = try foo();"
+  - "const y = foo() catch |err| return err;"
+  - "const z = foo() catch 0;"
+invalid:
+  - "const x = foo() catch {};"
+  - "foo() catch {};"

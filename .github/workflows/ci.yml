@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint-and-ast
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: jdx/mise-action@v3
+
+      - name: Run ast-grep rules and tests
+        run: mise run check:ast
+
+      - name: Run typos check
+        run: mise run check:typos
+
+      - name: Run complexity check
+        run: mise run check:complexity -- --all
+
+      - name: Run duplication check
+        run: mise run check:dup
+
+  build-and-test:
+    name: build-and-test
+    needs: [lint]
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native C build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config wayland-protocols libwayland-dev libwayland-bin \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
+            libpulse-dev libdrm-dev libva-dev
+
+      - uses: jdx/mise-action@v3
+
+      - name: Verify Zig formatting
+        run: |
+          if [ -f build.zig ]; then
+            zig fmt --check build.zig src
+          else
+            echo "No build.zig yet; skipping zig fmt"
+          fi
+
+      - name: Build and run unit tests
+        run: |
+          if [ -f build.zig ]; then
+            zig build
+            zig build test
+          else
+            echo "No build.zig yet; skipping zig build/test"
+          fi

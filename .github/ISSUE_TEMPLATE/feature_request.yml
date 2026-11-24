@@ -1,0 +1,19 @@
+name: Feature Request
+description: Propose a new feature or architectural improvement for wlrec
+title: "[Feat]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Use Case
+      description: Describe the workflow gap or performance bottleneck.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Interface & Scope
+      description: Proposed CLI flags, protocol scope, or sidecar schema impact.
+    validations:
+      required: true

@@ -1,0 +1,103 @@
+min_version = "2026.9.4"
+
+[tools]
+zig = "latest"
+hk = "latest"
+node = "latest"
+shfmt = "latest"
+clang-format = "latest"
+"github:ast-grep/ast-grep" = "latest"
+"github:kucherenko/jscpd" = "latest"
+"github:crate-ci/typos" = "latest"
+"pipx:lizard" = "latest"
+"npm:prettier" = "latest"
+
+[tasks.default]
+description = "List available tasks"
+run = "mise tasks"
+
+[tasks."hooks-install"]
+description = "Install or refresh hk Git hooks with mise integration"
+run = "hk install --mise"
+
+[tasks.check]
+description = "Run all hk checks across the repo"
+run = "hk run check"
+
+[tasks."check:plan"]
+description = "Preview hk check execution plan without running tools"
+run = "hk run check --plan"
+
+[tasks."check:changed"]
+description = "Run hk check only on modified/staged/untracked files"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+{
+  git diff --name-only -z
+  git diff --cached --name-only -z
+  git ls-files --others --exclude-standard -z
+} | hk run check --files0-from - "$@"
+"""
+
+[tasks."check:ast"]
+description = "Audit Zig AST anti-patterns across the repo and run rule tests"
+run = "ast-grep scan && ast-grep test --skip-snapshot-tests"
+
+[tasks."check:ast:changed"]
+description = "Enforce the AST ratchet on modified/staged/untracked Zig files"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+files=()
+while IFS= read -r path; do
+  case "$path" in
+    src/*.zig | src/**/*.zig | *.zig) files+=("$path") ;;
+  esac
+done < <({
+  git diff --name-only
+  git diff --cached --name-only
+  git ls-files --others --exclude-standard
+} | sort -u)
+if [ -z "${files[0]:-}" ]; then
+  echo "[check:ast:changed] no touched Zig files"
+  exit 0
+fi
+ast-grep scan "${files[@]}"
+"""
+
+[tasks."check:complexity"]
+description = "Audit Zig/C cyclomatic & cognitive complexity via lizard (CCN <= 15, CogC <= 15)"
+run = "bash scripts/check-complexity.sh \"$@\""
+
+[tasks."check:dup"]
+description = "Analyze code duplication across src/ using jscpd"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+if [ ! -d src ]; then
+  echo "[check:dup] no src/ directory yet"
+  exit 0
+fi
+jscpd --config .jscpd.json
+"""
+
+[tasks."check:typos"]
+description = "Check spelling and identifier integrity via typos"
+run = "typos"
+
+[tasks.fix]
+description = "Run all hk fixers to format files"
+run = "hk fix"
+
+[tasks.build]
+description = "Build wlrec in debug mode"
+run = "zig build"
+
+[tasks."build:release"]
+description = "Build wlrec with ReleaseSafe optimizations"
+run = "zig build -Doptimize=ReleaseSafe"
+
+[tasks.test]
+description = "Run Zig unit tests"
+run = "zig build test"

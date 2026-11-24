@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+.cache/
+*.mp4
+*.mkv
+*.flv
+*.jsonl

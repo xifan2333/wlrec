@@ -1,0 +1,24 @@
+name: Bug Report
+description: Report a capture, VAAPI, A/V sync, RTMP, or telemetry issue in wlrec
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Description
+      description: What went wrong and how to reproduce it?
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment (`wlrec probe`)
+      description: Paste output from `wlrec probe`, compositor version, and `vainfo`.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / ffprobe output
+      description: Relevant logs or `ffprobe` stream info.

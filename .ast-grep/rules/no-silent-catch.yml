@@ -1,0 +1,11 @@
+id: no-silent-catch
+message: "禁止使用空的 catch {} 静默吞掉错误。请使用 try 向上传播、带上下文记录日志或显式恢复。"
+severity: error
+language: Zig
+files:
+  - "src/**"
+rule:
+  kind: catch_expression
+  has:
+    kind: block
+    regex: "^\\{\\s*\\}$"
