@@ -43,11 +43,8 @@ pub const SurfaceSlot = struct {
 fn createSurfaceSlots(device: *encode.VaapiDevice, session: *capture.CopyCaptureSession, slots: *[2]SurfaceSlot) !void {
     var i: usize = 0;
     while (i < 2) : (i += 1) {
-        const surf = device.createAndExportSurface() catch return error.SurfaceAllocFailed;
-        errdefer {
-            _ = c.close(surf.fd);
-            device.destroySurface(surf.surface_id);
-        }
+        var surf = device.createAndExportSurface() catch return error.SurfaceAllocFailed;
+        errdefer device.destroySurface(&surf);
         const buf = capture.DmabufBuffer.import(
             session.dmabuf.?,
             session.width,
@@ -69,8 +66,7 @@ fn createSurfaceSlots(device: *encode.VaapiDevice, session: *capture.CopyCapture
 fn destroySurfaceSlots(device: *encode.VaapiDevice, slots: *[2]SurfaceSlot) void {
     for (slots) |*slot| {
         slot.buffer.deinit();
-        _ = c.close(slot.surface.fd);
-        device.destroySurface(slot.surface.surface_id);
+        device.destroySurface(&slot.surface);
     }
 }
 
@@ -113,30 +109,31 @@ fn initFirstFrame(
     return .{ .encoder = encoder, .first_out = first_out };
 }
 
-fn processFrame(
+const RecordingContext = struct {
     session: *capture.CopyCaptureSession,
     filter: *encode.VaapiFilterGraph,
     encoder: *encode.VaapiEncoder,
-    slot: *const SurfaceSlot,
     clock: *common.VfrClock,
-    stop_fd: ?std.posix.fd_t,
+    config: *const RecordConfig,
     out_fd: std.posix.fd_t,
     stats: *RecordStats,
-) !void {
-    const pts_ns = session.captureFrame(slot.buffer.buffer, stop_fd) catch |err| {
+};
+
+fn processFrame(ctx: *RecordingContext, slot: *const SurfaceSlot) !void {
+    const pts_ns = ctx.session.captureFrame(slot.buffer.buffer, ctx.config.stop_fd) catch |err| {
         if (err == capture.CaptureError.Interrupted) return;
         return error.CaptureFailed;
     };
-    stats.frames_captured += 1;
-    const rel_pts_ns = clock.registerFrame(pts_ns);
+    ctx.stats.frames_captured += 1;
+    const rel_pts_ns = ctx.clock.registerFrame(pts_ns);
     const pts_ms = common.VfrClock.rescaleNs(rel_pts_ns, 1, 1000);
 
-    const out_frame = filter.filterSurface(slot.surface.surface_id, pts_ms) catch return error.EncodeFailed;
+    const out_frame = ctx.filter.filterSurface(slot.surface.surface_id, pts_ms) catch return error.EncodeFailed;
     var out_f: ?*c.AVFrame = out_frame;
     defer c.av_frame_free(&out_f);
 
-    encoder.sendFrame(out_frame) catch return error.EncodeFailed;
-    try drainEncoderPackets(encoder, out_fd, stats);
+    ctx.encoder.sendFrame(out_frame) catch return error.EncodeFailed;
+    try drainEncoderPackets(ctx.encoder, ctx.out_fd, ctx.stats);
 }
 
 fn getMonotonicMs() u64 {
@@ -155,33 +152,15 @@ fn shouldStop(stats: *const RecordStats, config: *const RecordConfig, elapsed_ms
     return false;
 }
 
-fn recordLoop(
-    session: *capture.CopyCaptureSession,
-    filter: *encode.VaapiFilterGraph,
-    encoder: *encode.VaapiEncoder,
-    slots: *[2]SurfaceSlot,
-    clock: *common.VfrClock,
-    config: *const RecordConfig,
-    out_fd: std.posix.fd_t,
-    stats: *RecordStats,
-) !void {
+fn recordLoop(ctx: *RecordingContext, slots: *[2]SurfaceSlot) !void {
     var slot_idx: usize = 1;
     const start_time = getMonotonicMs();
 
     while (true) {
         const elapsed: u64 = getMonotonicMs() - start_time;
-        if (shouldStop(stats, config, elapsed)) break;
+        if (shouldStop(ctx.stats, ctx.config, elapsed)) break;
 
-        processFrame(
-            session,
-            filter,
-            encoder,
-            &slots[slot_idx],
-            clock,
-            config.stop_fd,
-            out_fd,
-            stats,
-        ) catch |err| {
+        processFrame(ctx, &slots[slot_idx]) catch |err| {
             if (err == capture.CaptureError.Interrupted) break;
             return err;
         };
@@ -224,7 +203,16 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
     c.av_frame_free(&first_f);
     try drainEncoderPackets(&encoder, out_fd, &stats);
 
-    try recordLoop(&session, &filter, &encoder, &slots, &clock, &config, out_fd, &stats);
+    var ctx = RecordingContext{
+        .session = &session,
+        .filter = &filter,
+        .encoder = &encoder,
+        .clock = &clock,
+        .config = &config,
+        .out_fd = out_fd,
+        .stats = &stats,
+    };
+    try recordLoop(&ctx, &slots);
 
     // Flush encoder
     encoder.sendFrame(null) catch return error.EncodeFailed;

@@ -16,6 +16,18 @@ pub const ExportedSurface = struct {
     modifier: u64,
     offset: u32,
     pitch: u32,
+
+    pub fn deinit(self: *ExportedSurface, va_display: c.VADisplay) void {
+        if (self.fd >= 0) {
+            _ = c.close(self.fd);
+            self.fd = -1;
+        }
+        if (self.surface_id != c.VA_INVALID_ID) {
+            var s = self.surface_id;
+            _ = c.vaDestroySurfaces(va_display, &s, 1);
+            self.surface_id = c.VA_INVALID_ID;
+        }
+    }
 };
 
 /// Hardware device manager for VAAPI and DMA-BUF surface export.
@@ -117,9 +129,8 @@ pub const VaapiDevice = struct {
         };
     }
 
-    pub fn destroySurface(self: *VaapiDevice, surf: c.VASurfaceID) void {
-        var s = surf;
-        _ = c.vaDestroySurfaces(self.va_display, &s, 1);
+    pub fn destroySurface(self: *VaapiDevice, surf: *ExportedSurface) void {
+        surf.deinit(self.va_display);
     }
 };
 

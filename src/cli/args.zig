@@ -8,7 +8,7 @@ pub const Subcommand = enum {
 };
 
 pub const RecordOptions = struct {
-    output_path: []const u8 = "output.mp4",
+    output_path: []const u8 = "output.h264",
     device_path: []const u8 = "/dev/dri/renderD128",
     fps: u32 = 60,
     qp: u8 = 23,
@@ -117,7 +117,7 @@ pub fn printUsage(writer: anytype) !void {
         \\  version, -v         Show version information
         \\
         \\Record Options:
-        \\  -o, --output <path>    Output file path (default: output.mp4)
+        \\  -o, --output <path>    Output file path (default: output.h264)
         \\  -d, --device <path>    DRM render node path (default: /dev/dri/renderD128)
         \\  -f, --fps <num>        Capture framerate (default: 60)
         \\  -q, --qp <num>         H.264 quantization parameter (default: 23)
@@ -151,7 +151,7 @@ test "parseFromSlice record defaults and options" {
     const rec_default = [_][]const u8{ "wlrec", "record" };
     const d_opts = try parseFromSlice(&rec_default);
     try std.testing.expectEqual(Subcommand.record, d_opts.subcommand);
-    try std.testing.expectEqualStrings("output.mp4", d_opts.record.output_path);
+    try std.testing.expectEqualStrings("output.h264", d_opts.record.output_path);
     try std.testing.expectEqual(@as(u32, 60), d_opts.record.fps);
     try std.testing.expectEqual(@as(u8, 23), d_opts.record.qp);
 
