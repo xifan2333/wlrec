@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <time.h>
 #include <unistd.h>
 
 #endif // WLREC_C_DEPS_H

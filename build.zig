@@ -119,4 +119,26 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    integration_tests.root_module.addImport("wlrec", root_mod);
+    integration_tests.root_module.addImport("c", c_mod);
+    integration_tests.root_module.link_libc = true;
+    integration_tests.root_module.linkSystemLibrary("wayland-client", .{});
+    integration_tests.root_module.linkSystemLibrary("avcodec", .{});
+    integration_tests.root_module.linkSystemLibrary("avformat", .{});
+    integration_tests.root_module.linkSystemLibrary("avfilter", .{});
+    integration_tests.root_module.linkSystemLibrary("avutil", .{});
+    integration_tests.root_module.linkSystemLibrary("va", .{});
+    integration_tests.root_module.linkSystemLibrary("va-drm", .{});
+    integration_tests.root_module.linkSystemLibrary("drm", .{});
+
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    test_step.dependOn(&run_integration_tests.step);
 }

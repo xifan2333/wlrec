@@ -47,28 +47,28 @@ pub const VaapiFilterGraph = struct {
     }
 
     pub fn init(device: *vaapi_device.VaapiDevice) FilterError!VaapiFilterGraph {
-        const graph = c.avfilter_graph_alloc() orelse return FilterError.GraphAllocFailed;
-        errdefer c.avfilter_graph_free(&@as(?*c.AVFilterGraph, graph));
+        var graph: ?*c.AVFilterGraph = c.avfilter_graph_alloc() orelse return FilterError.GraphAllocFailed;
+        errdefer c.avfilter_graph_free(&graph);
 
-        const in_ctx = try createInputFilter(graph, device);
+        const in_ctx = try createInputFilter(graph.?, device);
 
         const buffersink = c.avfilter_get_by_name("buffersink") orelse return FilterError.OutputFilterFailed;
         var out_ctx: ?*c.AVFilterContext = null;
-        if (c.avfilter_graph_create_filter(&out_ctx, buffersink, "out", null, null, graph) < 0 or out_ctx == null) {
+        if (c.avfilter_graph_create_filter(&out_ctx, buffersink, "out", null, null, graph.?) < 0 or out_ctx == null) {
             return FilterError.OutputFilterFailed;
         }
 
         const scale_filter = c.avfilter_get_by_name("scale_vaapi") orelse return FilterError.ScaleFilterFailed;
-        const scale_ctx = c.avfilter_graph_alloc_filter(graph, scale_filter, "scale") orelse return FilterError.ScaleFilterFailed;
+        const scale_ctx = c.avfilter_graph_alloc_filter(graph.?, scale_filter, "scale") orelse return FilterError.ScaleFilterFailed;
         scale_ctx.*.hw_device_ctx = c.av_buffer_ref(device.hw_device_ctx);
         if (c.avfilter_init_str(scale_ctx, "format=nv12") < 0) return FilterError.ScaleFilterFailed;
 
         if (c.avfilter_link(in_ctx, 0, scale_ctx, 0) < 0) return FilterError.LinkFailed;
         if (c.avfilter_link(scale_ctx, 0, out_ctx.?, 0) < 0) return FilterError.LinkFailed;
-        if (c.avfilter_graph_config(graph, null) < 0) return FilterError.GraphConfigFailed;
+        if (c.avfilter_graph_config(graph.?, null) < 0) return FilterError.GraphConfigFailed;
 
         return .{
-            .graph = graph,
+            .graph = graph.?,
             .in_ctx = in_ctx,
             .out_ctx = out_ctx.?,
             .in_frames_ref = device.in_frames_ref,
@@ -86,7 +86,8 @@ pub const VaapiFilterGraph = struct {
     /// Caller owns the returned AVFrame and must release it with av_frame_free.
     pub fn filterSurface(self: *VaapiFilterGraph, surface_id: c.VASurfaceID, pts_ms: i64) FilterError!*c.AVFrame {
         const in_frame = c.av_frame_alloc() orelse return FilterError.FrameAllocFailed;
-        defer c.av_frame_free(&@as(?*c.AVFrame, in_frame));
+        var in_f: ?*c.AVFrame = in_frame;
+        defer c.av_frame_free(&in_f);
 
         in_frame.*.format = c.AV_PIX_FMT_VAAPI;
         in_frame.*.width = @intCast(self.width);
@@ -101,7 +102,8 @@ pub const VaapiFilterGraph = struct {
         }
 
         const out_frame = c.av_frame_alloc() orelse return FilterError.FrameAllocFailed;
-        errdefer c.av_frame_free(&@as(?*c.AVFrame, out_frame));
+        var out_f: ?*c.AVFrame = out_frame;
+        errdefer c.av_frame_free(&out_f);
 
         if (c.av_buffersink_get_frame(self.out_ctx, out_frame) < 0) {
             return FilterError.PullFrameFailed;

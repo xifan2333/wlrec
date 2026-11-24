@@ -46,7 +46,7 @@ pub const VaapiDevice = struct {
         };
         errdefer c.av_buffer_unref(&frames_ref);
 
-        const frames_ctx: *c.AVHWFramesContext = @ptrCast(@alignCast(frames_ref.data));
+        const frames_ctx: *c.AVHWFramesContext = @ptrCast(@alignCast(frames_ref.*.data));
         frames_ctx.format = c.AV_PIX_FMT_VAAPI;
         frames_ctx.sw_format = c.AV_PIX_FMT_BGRA;
         frames_ctx.width = @intCast(width);

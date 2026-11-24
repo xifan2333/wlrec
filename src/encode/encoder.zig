@@ -8,7 +8,7 @@ pub const EncoderError = error{
     EncoderOpenFailed,
     SendFrameFailed,
     ReceivePacketFailed,
-};
+} || common.RateControlError;
 
 pub const EncodedPacket = struct {
     pts: i64,
@@ -44,7 +44,8 @@ pub const VaapiEncoder = struct {
         const ctx = c.avcodec_alloc_context3(codec) orelse {
             return EncoderError.ContextAllocFailed;
         };
-        errdefer c.avcodec_free_context(&@as(?*c.AVCodecContext, ctx));
+        var c_ctx: ?*c.AVCodecContext = ctx;
+        errdefer c.avcodec_free_context(&c_ctx);
 
         ctx.*.width = @intCast(width);
         ctx.*.height = @intCast(height);

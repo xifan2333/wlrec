@@ -3,28 +3,41 @@ pub const c = @import("c");
 pub const common = @import("common/lib.zig");
 pub const capture = @import("capture/lib.zig");
 pub const encode = @import("encode/lib.zig");
+pub const record = @import("record/lib.zig");
 pub const cli = @import("cli/lib.zig");
 
-fn dispatchSubcommand(opts: cli.args.CliOptions, stdout: anytype) !void {
+fn handleRecordSubcommand(allocator: std.mem.Allocator, rec_opts: cli.args.RecordOptions, stdout: anytype) !void {
+    try stdout.print("Recording screen to {s} (device: {s}, fps: {}, qp: {}, bitrate: {})...\n", .{
+        rec_opts.output_path,
+        rec_opts.device_path,
+        rec_opts.fps,
+        rec_opts.qp,
+        rec_opts.bitrate,
+    });
+
+    const config = record.engine.RecordConfig{
+        .output_path = rec_opts.output_path,
+        .device_path = @ptrCast(rec_opts.device_path.ptr),
+        .fps = rec_opts.fps,
+        .qp = rec_opts.qp,
+        .bitrate = rec_opts.bitrate,
+        .duration_secs = rec_opts.duration_secs,
+    };
+
+    const stats = try record.engine.runRecording(allocator, config);
+    try stdout.print("Recording complete: {} frames captured, {} encoded, {} bytes written\n", .{
+        stats.frames_captured,
+        stats.frames_encoded,
+        stats.bytes_written,
+    });
+}
+
+fn dispatchSubcommand(allocator: std.mem.Allocator, opts: cli.args.CliOptions, stdout: anytype) !void {
     switch (opts.subcommand) {
-        .help => {
-            try cli.args.printUsage(stdout);
-        },
-        .version => {
-            try stdout.writeAll("wlrec 0.1.0 (Wayland zero-copy VAAPI recorder)\n");
-        },
-        .probe => {
-            _ = try cli.probe.runProbe(stdout);
-        },
-        .record => {
-            try stdout.print("Starting recording to {s} (device: {s}, fps: {}, qp: {}, bitrate: {})\n", .{
-                opts.record.output_path,
-                opts.record.device_path,
-                opts.record.fps,
-                opts.record.qp,
-                opts.record.bitrate,
-            });
-        },
+        .help => try cli.args.printUsage(stdout),
+        .version => try stdout.writeAll("wlrec 0.1.0 (Wayland zero-copy VAAPI recorder)\n"),
+        .probe => _ = try cli.probe.runProbe(stdout),
+        .record => try handleRecordSubcommand(allocator, opts.record, stdout),
     }
 }
 
@@ -47,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    try dispatchSubcommand(opts, stdout);
+    try dispatchSubcommand(arena, opts, stdout);
     try stdout.flush();
 }
 
