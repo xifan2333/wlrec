@@ -14,6 +14,23 @@ pub const Dimensions = struct {
     }
 };
 
+/// Advertised DRM pixel format and format modifier pair.
+pub const drm_mod_linear: u64 = 0;
+pub const drm_mod_invalid: u64 = 0x00ffffffffffffff;
+
+pub const FormatModifierPair = struct {
+    format: u32,
+    modifier: u64,
+};
+
+/// Non-owning descriptor for a single DMA-BUF memory plane.
+pub const DmabufPlane = struct {
+    fd: std.posix.fd_t,
+    offset: u32,
+    pitch: u32,
+    modifier: u64,
+};
+
 /// Capture source target type.
 pub const CaptureSourceType = enum {
     output,

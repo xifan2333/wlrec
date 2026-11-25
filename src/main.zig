@@ -7,17 +7,28 @@ pub const record = @import("record/lib.zig");
 pub const cli = @import("cli/lib.zig");
 
 fn handleRecordSubcommand(allocator: std.mem.Allocator, rec_opts: cli.args.RecordOptions, stdout: anytype) !void {
-    try stdout.print("Recording screen to {s} (device: {s}, fps: {}, qp: {}, bitrate: {})...\n", .{
-        rec_opts.output_path,
-        rec_opts.device_path,
-        rec_opts.fps,
-        rec_opts.qp,
-        rec_opts.bitrate,
-    });
+    if (rec_opts.bitrate) |br| {
+        try stdout.print("Recording screen to {s} (device: {s}, fps: {}, bitrate: {} bps)...\n", .{
+            rec_opts.output_path,
+            rec_opts.device_path,
+            rec_opts.fps,
+            br,
+        });
+    } else {
+        try stdout.print("Recording screen to {s} (device: {s}, fps: {}, qp: {})...\n", .{
+            rec_opts.output_path,
+            rec_opts.device_path,
+            rec_opts.fps,
+            rec_opts.qp,
+        });
+    }
+
+    const dev_z = try allocator.dupeSentinel(u8, rec_opts.device_path, 0);
+    defer allocator.free(dev_z);
 
     const config = record.engine.RecordConfig{
         .output_path = rec_opts.output_path,
-        .device_path = @ptrCast(rec_opts.device_path.ptr),
+        .device_path = dev_z.ptr,
         .fps = rec_opts.fps,
         .qp = rec_opts.qp,
         .bitrate = rec_opts.bitrate,

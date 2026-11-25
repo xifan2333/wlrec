@@ -4,6 +4,7 @@ pub const encoder = @import("encoder.zig");
 
 pub const VaapiDevice = vaapi_device.VaapiDevice;
 pub const ExportedSurface = vaapi_device.ExportedSurface;
+pub const SurfacePlane = vaapi_device.SurfacePlane;
 pub const VaapiError = vaapi_device.VaapiError;
 
 pub const VaapiFilterGraph = filter_graph.VaapiFilterGraph;

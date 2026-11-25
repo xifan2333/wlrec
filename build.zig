@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         "Directory containing wayland-protocols",
     ) orelse "/usr/share/wayland-protocols";
 
+    const ffmpeg_include_dir = b.option(
+        []const u8,
+        "ffmpeg-include-dir",
+        "Additional include directory for FFmpeg headers",
+    );
+
     const Protocol = struct {
         name: []const u8,
         subpath: []const u8,
@@ -31,6 +37,10 @@ pub fn build(b: *std.Build) void {
         .{
             .name = "linux-dmabuf-v1",
             .subpath = "stable/linux-dmabuf/linux-dmabuf-v1.xml",
+        },
+        .{
+            .name = "xdg-shell",
+            .subpath = "stable/xdg-shell/xdg-shell.xml",
         },
     };
 
@@ -57,6 +67,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     translate_c.addIncludePath(b.path("src/c"));
+    if (ffmpeg_include_dir) |inc_dir| {
+        translate_c.addIncludePath(.{ .cwd_relative = inc_dir });
+    }
     for (gen_h_files) |h_file| {
         translate_c.addIncludePath(h_file.dirname());
     }

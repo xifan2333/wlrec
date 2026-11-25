@@ -12,7 +12,7 @@ pub const RecordOptions = struct {
     device_path: []const u8 = "/dev/dri/renderD128",
     fps: u32 = 60,
     qp: u8 = 23,
-    bitrate: u32 = 5_000_000,
+    bitrate: ?u32 = null,
     duration_secs: u64 = 0,
 };
 
@@ -31,10 +31,13 @@ pub const CliError = error{
 fn parseEncoderOption(flag: []const u8, val: []const u8, opts: *RecordOptions) !bool {
     if (std.mem.eql(u8, flag, "-q") or std.mem.eql(u8, flag, "--qp")) {
         opts.qp = std.fmt.parseInt(u8, val, 10) catch return error.InvalidNumber;
+        opts.bitrate = null;
         return true;
     }
     if (std.mem.eql(u8, flag, "-b") or std.mem.eql(u8, flag, "--bitrate")) {
-        opts.bitrate = std.fmt.parseInt(u32, val, 10) catch return error.InvalidNumber;
+        const br = std.fmt.parseInt(u32, val, 10) catch return error.InvalidNumber;
+        if (br == 0) return error.InvalidNumber;
+        opts.bitrate = br;
         return true;
     }
     return false;
@@ -120,8 +123,8 @@ pub fn printUsage(writer: anytype) !void {
         \\  -o, --output <path>    Output file path (default: output.h264)
         \\  -d, --device <path>    DRM render node path (default: /dev/dri/renderD128)
         \\  -f, --fps <num>        Capture framerate (default: 60)
-        \\  -q, --qp <num>         H.264 quantization parameter (default: 23)
-        \\  -b, --bitrate <num>    Target bitrate in bps (default: 5000000)
+        \\  -q, --qp <num>         H.264 CQP quantization parameter (default: 23)
+        \\  -b, --bitrate <num>    Target VBR bitrate in bps (overrides --qp)
         \\  --duration <seconds>   Recording duration limit in seconds (0 = unlimited)
         \\
     );
@@ -154,6 +157,7 @@ test "parseFromSlice record defaults and options" {
     try std.testing.expectEqualStrings("output.h264", d_opts.record.output_path);
     try std.testing.expectEqual(@as(u32, 60), d_opts.record.fps);
     try std.testing.expectEqual(@as(u8, 23), d_opts.record.qp);
+    try std.testing.expectEqual(@as(?u32, null), d_opts.record.bitrate);
 
     const rec_custom = [_][]const u8{
         "wlrec",      "record",
@@ -169,9 +173,14 @@ test "parseFromSlice record defaults and options" {
     try std.testing.expectEqualStrings("rec.h264", c_opts.record.output_path);
     try std.testing.expectEqual(@as(u32, 30), c_opts.record.fps);
     try std.testing.expectEqual(@as(u8, 18), c_opts.record.qp);
-    try std.testing.expectEqual(@as(u32, 8_000_000), c_opts.record.bitrate);
+    try std.testing.expectEqual(@as(?u32, 8_000_000), c_opts.record.bitrate);
     try std.testing.expectEqual(@as(u64, 10), c_opts.record.duration_secs);
     try std.testing.expectEqualStrings("/dev/dri/renderD129", c_opts.record.device_path);
+
+    const cqp_override = [_][]const u8{ "wlrec", "record", "-b", "8000000", "-q", "20" };
+    const q_opts = try parseFromSlice(&cqp_override);
+    try std.testing.expectEqual(@as(?u32, null), q_opts.record.bitrate);
+    try std.testing.expectEqual(@as(u8, 20), q_opts.record.qp);
 }
 
 test "parseFromSlice error handling" {
@@ -186,4 +195,7 @@ test "parseFromSlice error handling" {
 
     const bad_num = [_][]const u8{ "wlrec", "record", "-f", "not_a_number" };
     try std.testing.expectError(error.InvalidNumber, parseFromSlice(&bad_num));
+
+    const zero_bitrate = [_][]const u8{ "wlrec", "record", "-b", "0" };
+    try std.testing.expectError(error.InvalidNumber, parseFromSlice(&zero_bitrate));
 }

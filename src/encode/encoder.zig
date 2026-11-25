@@ -34,6 +34,7 @@ pub const VaapiEncoder = struct {
         height: u32,
         hw_frames_ctx: *c.AVBufferRef,
         profile: common.RateControlProfile,
+        fps: u32,
     ) EncoderError!VaapiEncoder {
         try profile.validate();
 
@@ -51,6 +52,8 @@ pub const VaapiEncoder = struct {
         ctx.*.height = @intCast(height);
         ctx.*.pix_fmt = c.AV_PIX_FMT_VAAPI;
         ctx.*.time_base = c.AVRational{ .num = 1, .den = 1000 };
+        const safe_fps = if (fps > 0) fps else 30;
+        ctx.*.framerate = c.AVRational{ .num = @intCast(safe_fps), .den = 1 };
         ctx.*.hw_frames_ctx = c.av_buffer_ref(hw_frames_ctx);
         ctx.*.max_b_frames = 0; // Disable B-frames for minimal latency
 

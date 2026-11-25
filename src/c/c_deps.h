@@ -1,10 +1,15 @@
 #ifndef WLREC_C_DEPS_H
 #define WLREC_C_DEPS_H
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "ext-foreign-toplevel-list-v1-client-protocol.h"
 #include "ext-image-capture-source-v1-client-protocol.h"
 #include "ext-image-copy-capture-v1-client-protocol.h"
 #include "linux-dmabuf-v1-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
 #include <wayland-client.h>
 
 #include <libavcodec/avcodec.h>
@@ -26,7 +31,9 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <stdlib.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
