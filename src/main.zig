@@ -38,11 +38,18 @@ fn handleRecordSubcommand(allocator: std.mem.Allocator, rec_opts: cli.args.Recor
     };
 
     const stats = try record.engine.runRecording(allocator, config);
-    try stdout.print("Recording complete: {} frames captured, {} encoded, {} bytes written\n", .{
+    try stdout.print("Recording complete: {} frames captured, {} encoded, {} bytes written", .{
         stats.frames_captured,
         stats.frames_encoded,
         stats.bytes_written,
     });
+    if (stats.packets_dropped > 0 or stats.reconnects > 0) {
+        try stdout.print(" ({} packets dropped, {} reconnects)", .{
+            stats.packets_dropped,
+            stats.reconnects,
+        });
+    }
+    try stdout.writeAll("\n");
 }
 
 fn dispatchSubcommand(allocator: std.mem.Allocator, opts: cli.args.CliOptions, stdout: anytype) !void {
