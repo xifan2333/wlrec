@@ -3,6 +3,7 @@ const c = @import("c");
 const common = @import("../common/lib.zig");
 
 pub const VaapiError = error{
+    OutOfMemory,
     DeviceCreateFailed,
     FramesContextAllocFailed,
     FramesContextInitFailed,
@@ -13,8 +14,6 @@ pub const VaapiError = error{
 };
 
 pub const SurfacePlane = common.DmabufPlane;
-
-const max_modifiers = 64;
 
 const FormatSpec = struct {
     drm_format: u32,
@@ -70,25 +69,22 @@ fn closeDescriptorFds(desc: *const c.VADRMPRIMESurfaceDescriptor) void {
 }
 
 pub fn collectModifiersForFormat(
+    allocator: std.mem.Allocator,
     constraints: []const common.FormatModifierPair,
     drm_format: u32,
-    out_mods: *[max_modifiers]u64,
-) struct { count: usize, found_format: bool, overflow: bool } {
-    var count: usize = 0;
+) VaapiError!struct { modifiers: []u64, found_format: bool } {
+    var list: std.ArrayList(u64) = .empty;
+    errdefer list.deinit(allocator);
+
     var found = false;
-    var overflow = false;
     for (constraints) |pair| {
         if (pair.format != drm_format) continue;
         found = true;
         if (pair.modifier == common.drm_mod_invalid) continue;
-        if (count < max_modifiers) {
-            out_mods[count] = pair.modifier;
-            count += 1;
-        } else {
-            overflow = true;
-        }
+        list.append(allocator, pair.modifier) catch return VaapiError.OutOfMemory;
     }
-    return .{ .count = count, .found_format = found, .overflow = overflow };
+    const modifiers = list.toOwnedSlice(allocator) catch return VaapiError.OutOfMemory;
+    return .{ .modifiers = modifiers, .found_format = found };
 }
 
 pub fn isPairSupported(constraints: []const common.FormatModifierPair, drm_format: u32, modifier: u64) bool {
@@ -210,6 +206,7 @@ fn exportAndValidateSurface(
 
 /// Hardware device manager for VAAPI and negotiated DMA-BUF surface export.
 pub const VaapiDevice = struct {
+    allocator: std.mem.Allocator,
     hw_device_ctx: *c.AVBufferRef,
     va_display: c.VADisplay,
     in_frames_ref: *c.AVBufferRef,
@@ -217,35 +214,34 @@ pub const VaapiDevice = struct {
     width: u32,
     height: u32,
     selected_spec: FormatSpec,
-    modifiers: [max_modifiers]u64 = undefined,
-    modifier_count: usize = 0,
+    modifiers: []u64,
 
     fn negotiateFormat(
+        allocator: std.mem.Allocator,
         va_dpy: c.VADisplay,
         width: u32,
         height: u32,
         constraints: []const common.FormatModifierPair,
-        out_mods: *[max_modifiers]u64,
-    ) VaapiError!struct { spec: FormatSpec, mod_count: usize } {
+    ) VaapiError!struct { spec: FormatSpec, modifiers: []u64 } {
         for (supported_rgb_formats) |spec| {
-            const collected = collectModifiersForFormat(constraints, spec.drm_format, out_mods);
-            if (constraints.len > 0 and !collected.found_format) continue;
-            if (collected.overflow) {
-                std.log.warn("format 0x{x} advertised more than {d} modifiers; truncating to first {d}", .{
-                    spec.drm_format,
-                    max_modifiers,
-                    max_modifiers,
-                });
+            const collected = try collectModifiersForFormat(allocator, constraints, spec.drm_format);
+            if (constraints.len > 0 and !collected.found_format) {
+                allocator.free(collected.modifiers);
+                continue;
             }
 
-            const surf = createRawSurface(va_dpy, width, height, spec.va_fourcc, out_mods[0..collected.count]) catch continue;
+            const surf = createRawSurface(va_dpy, width, height, spec.va_fourcc, collected.modifiers) catch {
+                allocator.free(collected.modifiers);
+                continue;
+            };
             var exported = exportAndValidateSurface(va_dpy, surf, spec.drm_format, constraints) catch {
                 var s = surf;
                 _ = c.vaDestroySurfaces(va_dpy, &s, 1);
+                allocator.free(collected.modifiers);
                 continue;
             };
             exported.deinit(va_dpy);
-            return .{ .spec = spec, .mod_count = collected.count };
+            return .{ .spec = spec, .modifiers = collected.modifiers };
         }
         return VaapiError.UnsupportedFormat;
     }
@@ -270,6 +266,7 @@ pub const VaapiDevice = struct {
     }
 
     pub fn init(
+        allocator: std.mem.Allocator,
         device_path: ?[*:0]const u8,
         width: u32,
         height: u32,
@@ -286,19 +283,19 @@ pub const VaapiDevice = struct {
         const va_dev_ctx: *c.AVVAAPIDeviceContext = @ptrCast(@alignCast(dev_ctx.hwctx));
         const va_dpy = va_dev_ctx.display;
 
-        var mods: [max_modifiers]u64 = undefined;
-        const neg = try negotiateFormat(va_dpy, width, height, constraints, &mods);
+        const neg = try negotiateFormat(allocator, va_dpy, width, height, constraints);
+        errdefer allocator.free(neg.modifiers);
         const frames_ref = try createFramesContext(hw_device.?, width, height, neg.spec.sw_format);
 
         return .{
+            .allocator = allocator,
             .hw_device_ctx = hw_device.?,
             .va_display = va_dpy,
             .in_frames_ref = frames_ref,
             .width = width,
             .height = height,
             .selected_spec = neg.spec,
-            .modifiers = mods,
-            .modifier_count = neg.mod_count,
+            .modifiers = neg.modifiers,
         };
     }
 
@@ -309,22 +306,24 @@ pub const VaapiDevice = struct {
         height: u32,
         constraints: []const common.FormatModifierPair,
     ) VaapiError!void {
-        var mods: [max_modifiers]u64 = undefined;
-        const neg = try negotiateFormat(self.va_display, width, height, constraints, &mods);
+        const neg = try negotiateFormat(self.allocator, self.va_display, width, height, constraints);
+        errdefer self.allocator.free(neg.modifiers);
         const new_frames = try createFramesContext(self.hw_device_ctx, width, height, neg.spec.sw_format);
 
         var old_frames = @as(?*c.AVBufferRef, self.in_frames_ref);
         c.av_buffer_unref(&old_frames);
+        self.allocator.free(self.modifiers);
 
         self.in_frames_ref = new_frames;
         self.width = width;
         self.height = height;
         self.selected_spec = neg.spec;
-        self.modifiers = mods;
-        self.modifier_count = neg.mod_count;
+        self.modifiers = neg.modifiers;
     }
 
     pub fn deinit(self: *VaapiDevice) void {
+        self.allocator.free(self.modifiers);
+
         var frames = @as(?*c.AVBufferRef, self.in_frames_ref);
         c.av_buffer_unref(&frames);
 
@@ -342,7 +341,7 @@ pub const VaapiDevice = struct {
             self.width,
             self.height,
             self.selected_spec.va_fourcc,
-            self.modifiers[0..self.modifier_count],
+            self.modifiers,
         );
         return exportAndValidateSurface(self.va_display, surf, self.selected_spec.drm_format, constraints) catch |err| {
             var s = surf;
@@ -370,33 +369,32 @@ test "VaapiDevice format constraint matching" {
     try std.testing.expect(isPairSupported(&implicit_constraints, c.DRM_FORMAT_XRGB8888, common.drm_mod_invalid));
     try std.testing.expect(!isPairSupported(&implicit_constraints, c.DRM_FORMAT_XRGB8888, common.drm_mod_linear));
 
-    var mods: [max_modifiers]u64 = undefined;
-    const res = collectModifiersForFormat(&explicit_constraints, c.DRM_FORMAT_XRGB8888, &mods);
+    const res = try collectModifiersForFormat(std.testing.allocator, &explicit_constraints, c.DRM_FORMAT_XRGB8888);
+    defer std.testing.allocator.free(res.modifiers);
     try std.testing.expect(res.found_format);
-    try std.testing.expect(!res.overflow);
-    try std.testing.expectEqual(@as(usize, 1), res.count);
+    try std.testing.expectEqual(@as(usize, 1), res.modifiers.len);
+    try std.testing.expectEqual(common.drm_mod_linear, res.modifiers[0]);
 }
 
-test "collectModifiersForFormat reports overflow and preserves matching past limit" {
-    var constraints: [max_modifiers + 2]common.FormatModifierPair = undefined;
-    for (0..max_modifiers) |i| {
+test "collectModifiersForFormat retains arbitrary modifier counts without truncation" {
+    var constraints: [102]common.FormatModifierPair = undefined;
+    for (0..100) |i| {
         constraints[i] = .{ .format = c.DRM_FORMAT_ARGB8888, .modifier = @intCast(i + 1) };
     }
-    constraints[max_modifiers] = .{ .format = c.DRM_FORMAT_ARGB8888, .modifier = common.drm_mod_linear };
-    constraints[max_modifiers + 1] = .{ .format = c.DRM_FORMAT_XRGB8888, .modifier = common.drm_mod_linear };
+    constraints[100] = .{ .format = c.DRM_FORMAT_ARGB8888, .modifier = common.drm_mod_linear };
+    constraints[101] = .{ .format = c.DRM_FORMAT_XRGB8888, .modifier = common.drm_mod_linear };
 
-    var mods: [max_modifiers]u64 = undefined;
-    const argb_res = collectModifiersForFormat(&constraints, c.DRM_FORMAT_ARGB8888, &mods);
+    const argb_res = try collectModifiersForFormat(std.testing.allocator, &constraints, c.DRM_FORMAT_ARGB8888);
+    defer std.testing.allocator.free(argb_res.modifiers);
     try std.testing.expect(argb_res.found_format);
-    try std.testing.expect(argb_res.overflow);
-    try std.testing.expectEqual(@as(usize, max_modifiers), argb_res.count);
-    try std.testing.expect(isPairSupported(&constraints, c.DRM_FORMAT_ARGB8888, common.drm_mod_linear));
+    try std.testing.expectEqual(@as(usize, 101), argb_res.modifiers.len);
+    try std.testing.expectEqual(common.drm_mod_linear, argb_res.modifiers[100]);
 
-    const xrgb_res = collectModifiersForFormat(&constraints, c.DRM_FORMAT_XRGB8888, &mods);
+    const xrgb_res = try collectModifiersForFormat(std.testing.allocator, &constraints, c.DRM_FORMAT_XRGB8888);
+    defer std.testing.allocator.free(xrgb_res.modifiers);
     try std.testing.expect(xrgb_res.found_format);
-    try std.testing.expect(!xrgb_res.overflow);
-    try std.testing.expectEqual(@as(usize, 1), xrgb_res.count);
-    try std.testing.expectEqual(common.drm_mod_linear, mods[0]);
+    try std.testing.expectEqual(@as(usize, 1), xrgb_res.modifiers.len);
+    try std.testing.expectEqual(common.drm_mod_linear, xrgb_res.modifiers[0]);
 }
 
 test "buildValidatedExportedSurface rejects bad object index or modifier without destroying surface" {

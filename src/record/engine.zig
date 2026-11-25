@@ -108,7 +108,8 @@ fn isGracefulStop(err: anyerror) bool {
     return err == capture.CaptureError.Interrupted or err == capture.CaptureError.Timeout;
 }
 
-fn mapVaapiError(err: encode.VaapiError) RecordError {
+fn mapVaapiError(err: encode.VaapiError) (RecordError || error{OutOfMemory}) {
+    if (err == encode.VaapiError.OutOfMemory) return error.OutOfMemory;
     return if (err == encode.VaapiError.UnsupportedFormat) error.UnsupportedFormat else error.VaapiInitFailed;
 }
 
@@ -121,6 +122,7 @@ fn rebindDeviceAndSlots(
 ) !void {
     session.waitConstraints(stop_fd, deadline_ms) catch |err| {
         if (isGracefulStop(err)) return err;
+        if (err == capture.CaptureError.OutOfMemory) return error.OutOfMemory;
         return error.CaptureFailed;
     };
 
@@ -290,10 +292,14 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
     defer _ = c.close(out_fd);
 
     var session: capture.CopyCaptureSession = .{};
-    session.init(null) catch return error.WaylandConnectFailed;
+    session.init(allocator, null) catch |err| {
+        if (err == capture.CaptureError.OutOfMemory) return error.OutOfMemory;
+        return error.WaylandConnectFailed;
+    };
     defer session.deinit();
 
     var device = encode.VaapiDevice.init(
+        allocator,
         config.device_path,
         session.width,
         session.height,
