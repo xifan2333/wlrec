@@ -73,18 +73,22 @@ pub fn collectModifiersForFormat(
     constraints: []const common.FormatModifierPair,
     drm_format: u32,
     out_mods: *[max_modifiers]u64,
-) struct { count: usize, found_format: bool } {
+) struct { count: usize, found_format: bool, overflow: bool } {
     var count: usize = 0;
     var found = false;
+    var overflow = false;
     for (constraints) |pair| {
         if (pair.format != drm_format) continue;
         found = true;
-        if (pair.modifier != common.drm_mod_invalid and count < max_modifiers) {
+        if (pair.modifier == common.drm_mod_invalid) continue;
+        if (count < max_modifiers) {
             out_mods[count] = pair.modifier;
             count += 1;
+        } else {
+            overflow = true;
         }
     }
-    return .{ .count = count, .found_format = found };
+    return .{ .count = count, .found_format = found, .overflow = overflow };
 }
 
 pub fn isPairSupported(constraints: []const common.FormatModifierPair, drm_format: u32, modifier: u64) bool {
@@ -137,29 +141,17 @@ fn createRawSurface(
     return surf;
 }
 
-fn exportAndValidateSurface(
-    va_display: c.VADisplay,
+fn buildValidatedExportedSurface(
     surf: c.VASurfaceID,
     expected_drm_format: u32,
     constraints: []const common.FormatModifierPair,
+    desc: *const c.VADRMPRIMESurfaceDescriptor,
 ) VaapiError!ExportedSurface {
-    var desc: c.VADRMPRIMESurfaceDescriptor = std.mem.zeroes(c.VADRMPRIMESurfaceDescriptor);
-    const exp_st = c.vaExportSurfaceHandle(
-        va_display,
-        surf,
-        c.VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-        c.VA_EXPORT_SURFACE_READ_WRITE | c.VA_EXPORT_SURFACE_COMPOSED_LAYERS,
-        &desc,
-    );
-    if (exp_st != c.VA_STATUS_SUCCESS) return VaapiError.SurfaceExportFailed;
-
     if (desc.num_layers != 1 or desc.layers[0].num_planes == 0 or desc.layers[0].num_planes > 4 or desc.num_objects == 0 or desc.num_objects > 4) {
-        closeDescriptorFds(&desc);
         return VaapiError.UnsupportedLayout;
     }
 
     if (desc.layers[0].drm_format != expected_drm_format) {
-        closeDescriptorFds(&desc);
         return VaapiError.UnsupportedFormat;
     }
 
@@ -179,12 +171,10 @@ fn exportAndValidateSurface(
     while (pl_i < desc.layers[0].num_planes) : (pl_i += 1) {
         const obj_idx = desc.layers[0].object_index[pl_i];
         if (obj_idx >= desc.num_objects) {
-            exported.deinit(va_display);
             return VaapiError.UnsupportedLayout;
         }
         const mod = desc.objects[obj_idx].drm_format_modifier;
         if (!isPairSupported(constraints, exported.drm_format, mod)) {
-            exported.deinit(va_display);
             return VaapiError.UnsupportedFormat;
         }
         exported.planes[pl_i] = .{
@@ -196,6 +186,26 @@ fn exportAndValidateSurface(
     }
 
     return exported;
+}
+
+fn exportAndValidateSurface(
+    va_display: c.VADisplay,
+    surf: c.VASurfaceID,
+    expected_drm_format: u32,
+    constraints: []const common.FormatModifierPair,
+) VaapiError!ExportedSurface {
+    var desc: c.VADRMPRIMESurfaceDescriptor = std.mem.zeroes(c.VADRMPRIMESurfaceDescriptor);
+    const exp_st = c.vaExportSurfaceHandle(
+        va_display,
+        surf,
+        c.VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+        c.VA_EXPORT_SURFACE_READ_WRITE | c.VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+        &desc,
+    );
+    if (exp_st != c.VA_STATUS_SUCCESS) return VaapiError.SurfaceExportFailed;
+    errdefer closeDescriptorFds(&desc);
+
+    return buildValidatedExportedSurface(surf, expected_drm_format, constraints, &desc);
 }
 
 /// Hardware device manager for VAAPI and negotiated DMA-BUF surface export.
@@ -220,6 +230,13 @@ pub const VaapiDevice = struct {
         for (supported_rgb_formats) |spec| {
             const collected = collectModifiersForFormat(constraints, spec.drm_format, out_mods);
             if (constraints.len > 0 and !collected.found_format) continue;
+            if (collected.overflow) {
+                std.log.warn("format 0x{x} advertised more than {d} modifiers; truncating to first {d}", .{
+                    spec.drm_format,
+                    max_modifiers,
+                    max_modifiers,
+                });
+            }
 
             const surf = createRawSurface(va_dpy, width, height, spec.va_fourcc, out_mods[0..collected.count]) catch continue;
             var exported = exportAndValidateSurface(va_dpy, surf, spec.drm_format, constraints) catch {
@@ -356,5 +373,60 @@ test "VaapiDevice format constraint matching" {
     var mods: [max_modifiers]u64 = undefined;
     const res = collectModifiersForFormat(&explicit_constraints, c.DRM_FORMAT_XRGB8888, &mods);
     try std.testing.expect(res.found_format);
+    try std.testing.expect(!res.overflow);
     try std.testing.expectEqual(@as(usize, 1), res.count);
+}
+
+test "collectModifiersForFormat reports overflow and preserves matching past limit" {
+    var constraints: [max_modifiers + 2]common.FormatModifierPair = undefined;
+    for (0..max_modifiers) |i| {
+        constraints[i] = .{ .format = c.DRM_FORMAT_ARGB8888, .modifier = @intCast(i + 1) };
+    }
+    constraints[max_modifiers] = .{ .format = c.DRM_FORMAT_ARGB8888, .modifier = common.drm_mod_linear };
+    constraints[max_modifiers + 1] = .{ .format = c.DRM_FORMAT_XRGB8888, .modifier = common.drm_mod_linear };
+
+    var mods: [max_modifiers]u64 = undefined;
+    const argb_res = collectModifiersForFormat(&constraints, c.DRM_FORMAT_ARGB8888, &mods);
+    try std.testing.expect(argb_res.found_format);
+    try std.testing.expect(argb_res.overflow);
+    try std.testing.expectEqual(@as(usize, max_modifiers), argb_res.count);
+    try std.testing.expect(isPairSupported(&constraints, c.DRM_FORMAT_ARGB8888, common.drm_mod_linear));
+
+    const xrgb_res = collectModifiersForFormat(&constraints, c.DRM_FORMAT_XRGB8888, &mods);
+    try std.testing.expect(xrgb_res.found_format);
+    try std.testing.expect(!xrgb_res.overflow);
+    try std.testing.expectEqual(@as(usize, 1), xrgb_res.count);
+    try std.testing.expectEqual(common.drm_mod_linear, mods[0]);
+}
+
+test "buildValidatedExportedSurface rejects bad object index or modifier without destroying surface" {
+    const constraints = [_]common.FormatModifierPair{
+        .{ .format = c.DRM_FORMAT_XRGB8888, .modifier = common.drm_mod_linear },
+    };
+
+    var bad_obj_desc: c.VADRMPRIMESurfaceDescriptor = std.mem.zeroes(c.VADRMPRIMESurfaceDescriptor);
+    bad_obj_desc.num_objects = 1;
+    bad_obj_desc.objects[0].fd = -1;
+    bad_obj_desc.objects[0].drm_format_modifier = common.drm_mod_linear;
+    bad_obj_desc.num_layers = 1;
+    bad_obj_desc.layers[0].drm_format = c.DRM_FORMAT_XRGB8888;
+    bad_obj_desc.layers[0].num_planes = 1;
+    bad_obj_desc.layers[0].object_index[0] = 1;
+    try std.testing.expectError(
+        VaapiError.UnsupportedLayout,
+        buildValidatedExportedSurface(1, c.DRM_FORMAT_XRGB8888, &constraints, &bad_obj_desc),
+    );
+
+    var bad_mod_desc: c.VADRMPRIMESurfaceDescriptor = std.mem.zeroes(c.VADRMPRIMESurfaceDescriptor);
+    bad_mod_desc.num_objects = 1;
+    bad_mod_desc.objects[0].fd = -1;
+    bad_mod_desc.objects[0].drm_format_modifier = common.drm_mod_invalid;
+    bad_mod_desc.num_layers = 1;
+    bad_mod_desc.layers[0].drm_format = c.DRM_FORMAT_XRGB8888;
+    bad_mod_desc.layers[0].num_planes = 1;
+    bad_mod_desc.layers[0].object_index[0] = 0;
+    try std.testing.expectError(
+        VaapiError.UnsupportedFormat,
+        buildValidatedExportedSurface(1, c.DRM_FORMAT_XRGB8888, &constraints, &bad_mod_desc),
+    );
 }

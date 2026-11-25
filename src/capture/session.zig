@@ -26,8 +26,6 @@ pub const WaylandCapabilities = struct {
     dmabuf_ok: bool = false,
 };
 
-const max_format_pairs = 256;
-
 const supported_drm_formats = [_]u32{
     c.DRM_FORMAT_ARGB8888,
     c.DRM_FORMAT_XRGB8888,
@@ -35,11 +33,18 @@ const supported_drm_formats = [_]u32{
     c.DRM_FORMAT_XBGR8888,
 };
 
-pub fn isSupportedRgbDrmFormat(format: u32) bool {
-    for (supported_drm_formats) |supported| {
-        if (format == supported) return true;
+const max_modifiers_per_format = 64;
+const max_format_pairs = supported_drm_formats.len * max_modifiers_per_format;
+
+fn supportedFormatIndex(format: u32) ?usize {
+    for (supported_drm_formats, 0..) |supported, idx| {
+        if (format == supported) return idx;
     }
-    return false;
+    return null;
+}
+
+pub fn isSupportedRgbDrmFormat(format: u32) bool {
+    return supportedFormatIndex(format) != null;
 }
 
 pub fn isSupportedDmabufVersion(ver: u32) bool {
@@ -64,6 +69,8 @@ pub const CopyCaptureSession = struct {
     device_minor: u32 = 0,
     formats: [max_format_pairs]FormatModifierPair = undefined,
     format_count: usize = 0,
+    per_format_counts: [supported_drm_formats.len]usize = @splat(0),
+    format_overflow: bool = false,
     session_done: bool = false,
     session_stopped: bool = false,
 
@@ -124,6 +131,9 @@ pub const CopyCaptureSession = struct {
         }
 
         if (self.session_stopped) return CaptureError.SessionStopped;
+        if (self.format_overflow) {
+            std.log.warn("compositor advertised more than {d} modifiers for a supported RGB format; excess modifiers were dropped", .{max_modifiers_per_format});
+        }
     }
 
     pub fn deinit(self: *CopyCaptureSession) void {
@@ -142,10 +152,16 @@ pub const CopyCaptureSession = struct {
         return self.formats[0..self.format_count];
     }
 
+    pub fn hasFormatOverflow(self: *const CopyCaptureSession) bool {
+        return self.format_overflow;
+    }
+
     pub fn beginConstraintBatch(self: *CopyCaptureSession) void {
         if (self.session_done) {
             self.session_done = false;
             self.format_count = 0;
+            self.per_format_counts = @splat(0);
+            self.format_overflow = false;
         }
     }
 
@@ -165,26 +181,29 @@ pub const CopyCaptureSession = struct {
         self.device_minor = minor;
     }
 
-    fn appendUniqueFormatPair(self: *CopyCaptureSession, format: u32, modifier: u64) void {
+    fn appendUniqueFormatPair(self: *CopyCaptureSession, fmt_idx: usize, format: u32, modifier: u64) void {
         for (self.formats[0..self.format_count]) |existing| {
             if (existing.format == format and existing.modifier == modifier) return;
         }
-        if (self.format_count < max_format_pairs) {
-            self.formats[self.format_count] = .{ .format = format, .modifier = modifier };
-            self.format_count += 1;
+        if (self.per_format_counts[fmt_idx] >= max_modifiers_per_format or self.format_count >= max_format_pairs) {
+            self.format_overflow = true;
+            return;
         }
+        self.formats[self.format_count] = .{ .format = format, .modifier = modifier };
+        self.format_count += 1;
+        self.per_format_counts[fmt_idx] += 1;
     }
 
     pub fn recordDmabufFormat(self: *CopyCaptureSession, format: u32, modifiers: []const u64) void {
         self.beginConstraintBatch();
-        if (!isSupportedRgbDrmFormat(format)) return;
+        const fmt_idx = supportedFormatIndex(format) orelse return;
 
         if (modifiers.len == 0) {
-            self.appendUniqueFormatPair(format, common.drm_mod_invalid);
+            self.appendUniqueFormatPair(fmt_idx, format, common.drm_mod_invalid);
             return;
         }
         for (modifiers) |mod| {
-            self.appendUniqueFormatPair(format, mod);
+            self.appendUniqueFormatPair(fmt_idx, format, mod);
         }
     }
 
@@ -250,6 +269,9 @@ pub const CopyCaptureSession = struct {
             try self.pollDispatchStep(stop_fd, deadline_ms);
         }
         if (self.session_stopped) return CaptureError.SessionStopped;
+        if (self.format_overflow) {
+            std.log.warn("compositor advertised more than {d} modifiers for a supported RGB format; excess modifiers were dropped", .{max_modifiers_per_format});
+        }
     }
 
     fn mapFailureReason(reason: u32) CaptureError {
@@ -522,4 +544,27 @@ test "CopyCaptureSession constraint retention filters non-RGB formats and resets
     try std.testing.expectEqual(@as(usize, 1), sess.advertisedFormats().len);
     try std.testing.expectEqual(c.DRM_FORMAT_ARGB8888, sess.advertisedFormats()[0].format);
     try std.testing.expectEqual(common.drm_mod_invalid, sess.advertisedFormats()[0].modifier);
+    try std.testing.expect(!sess.hasFormatOverflow());
+}
+
+test "CopyCaptureSession per-format quota preserves other formats and reports overflow" {
+    var sess = CopyCaptureSession{};
+    sess.recordBufferSize(1920, 1080);
+
+    var argb_mods: [max_format_pairs]u64 = undefined;
+    for (&argb_mods, 0..) |*m, idx| m.* = @intCast(idx + 1);
+    sess.recordDmabufFormat(c.DRM_FORMAT_ARGB8888, &argb_mods);
+    sess.recordDmabufFormat(c.DRM_FORMAT_XRGB8888, &.{common.drm_mod_linear});
+    sess.markSessionDone();
+
+    try std.testing.expect(sess.hasFormatOverflow());
+    try std.testing.expectEqual(@as(usize, max_modifiers_per_format + 1), sess.advertisedFormats().len);
+    const last = sess.advertisedFormats()[sess.advertisedFormats().len - 1];
+    try std.testing.expectEqual(c.DRM_FORMAT_XRGB8888, last.format);
+    try std.testing.expectEqual(common.drm_mod_linear, last.modifier);
+
+    // Next constraint batch clears overflow state
+    sess.recordBufferSize(1280, 720);
+    try std.testing.expect(!sess.hasFormatOverflow());
+    try std.testing.expectEqual(@as(usize, 0), sess.advertisedFormats().len);
 }
