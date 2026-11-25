@@ -1,7 +1,9 @@
 .zig-cache/
 zig-out/
 .cache/
+*.h264
 *.mp4
 *.mkv
 *.flv
 *.jsonl
+.pi/*.pid

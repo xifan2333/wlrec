@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/xifan2333/pi-ghwebhook/main/schemas/ghwebhook.schema.json",
+  "name": "CI & Review Automation",
+  "on": {
+    "workflow_run": {
+      "types": ["completed"],
+      "branches": ["@current"],
+      "workflows": ["ci"]
+    },
+    "pull_request_review": {
+      "types": ["submitted"],
+      "branches": ["@current"]
+    }
+  },
+  "jobs": {
+    "ci-failure": {
+      "if": "github.event.workflow_run.conclusion == 'failure'",
+      "prompt": "CI run ({{ workflow }}) failed on branch {{ branch }}.\n\nRun URL: {{ run_url }}\nCommit: {{ head_sha }}\n\nPlease run `gh run view {{ run_id }} --log-failed` to diagnose the error (following `wlrec-diagnose`) and prepare a fix.",
+      "deliverAs": "followUp"
+    },
+    "ci-success": {
+      "if": "github.event.workflow_run.conclusion == 'success'",
+      "prompt": "Remote CI ({{ workflow }}) has passed on branch {{ branch }}.\n\nRun URL: {{ run_url }}\n\nPlease check PR checks status (`gh pr checks`) and verify if it is ready to merge.",
+      "deliverAs": "followUp"
+    },
+    "review-bot": {
+      "if": "github.event.review.user.type == 'Bot'",
+      "prompt": "Received review comments from {{ sender }} on PR #{{ pr_number }} ({{ pr_url }}):\n\nState: {{ review_state }}\nDetails:\n{{ review_body }}\n\nPlease evaluate these comments critically via `wlrec-review` (`[FIX] / [DISMISS] / [ASK]`): fix real bugs, and refute hallucinations/false positives.",
+      "deliverAs": "steer"
+    }
+  }
+}
