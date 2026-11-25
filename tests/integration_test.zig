@@ -221,7 +221,7 @@ fn runDamageGenerator(tctx: *ThreadCtx) void {
     pumpFrames(client.display.?, surf, &slots, pixels, tctx);
 }
 
-test "live desktop zero-copy capture to h264 file" {
+fn runLiveCaptureCase(filename: []const u8, magic_offset: usize, expected_magic: []const u8) !void {
     const dpy = c.wl_display_connect(null);
     if (dpy == null) {
         std.log.info("SKIPPED: No Wayland display available in test environment", .{});
@@ -240,7 +240,7 @@ test "live desktop zero-copy capture to h264 file" {
     const dir_ptr = c.mkdtemp(&dir_tpl[0]) orelse return error.TempDirFailed;
     const dir_slice = std.mem.span(dir_ptr);
     var out_buf: [128]u8 = undefined;
-    const out_slice = try std.fmt.bufPrint(out_buf[0 .. out_buf.len - 1], "{s}/burst.h264", .{dir_slice});
+    const out_slice = try std.fmt.bufPrint(out_buf[0 .. out_buf.len - 1], "{s}/{s}", .{ dir_slice, filename });
     out_buf[out_slice.len] = 0;
     const out_path_z = out_buf[0..out_slice.len :0];
     defer {
@@ -274,14 +274,23 @@ test "live desktop zero-copy capture to h264 file" {
     try std.testing.expect(stats.frames_captured >= 5);
     try std.testing.expect(stats.frames_encoded >= 5);
     try std.testing.expect(stats.bytes_written > 1000);
+    try std.testing.expectEqual(@as(u64, 0), stats.packets_dropped);
     try std.testing.expect(stats.first_keyframe_seen);
 
     const check_fd = c.open(out_path_z.ptr, c.O_RDONLY);
     try std.testing.expect(check_fd >= 0);
     defer _ = c.close(check_fd);
 
-    var header: [4]u8 = undefined;
-    const n = c.read(check_fd, &header[0], 4);
-    try std.testing.expectEqual(@as(isize, 4), n);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 1 }, &header);
+    var header: [8]u8 = undefined;
+    const n = c.read(check_fd, &header[0], 8);
+    try std.testing.expectEqual(@as(isize, 8), n);
+    try std.testing.expectEqualSlices(u8, expected_magic, header[magic_offset .. magic_offset + expected_magic.len]);
+}
+
+test "live desktop zero-copy capture to h264 file" {
+    try runLiveCaptureCase("burst.h264", 0, &[_]u8{ 0, 0, 0, 1 });
+}
+
+test "live desktop zero-copy capture to mp4 container" {
+    try runLiveCaptureCase("burst.mp4", 4, "ftyp");
 }

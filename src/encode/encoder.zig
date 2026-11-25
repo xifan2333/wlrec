@@ -42,6 +42,7 @@ pub const VaapiEncoder = struct {
         hw_frames_ctx: *c.AVBufferRef,
         profile: common.RateControlProfile,
         fps: u32,
+        global_header: bool,
     ) EncoderError!VaapiEncoder {
         try profile.validate();
 
@@ -63,6 +64,9 @@ pub const VaapiEncoder = struct {
         ctx.*.framerate = c.AVRational{ .num = @intCast(safe_fps), .den = 1 };
         ctx.*.hw_frames_ctx = c.av_buffer_ref(hw_frames_ctx);
         ctx.*.max_b_frames = 0; // Disable B-frames for minimal latency
+        if (global_header) {
+            ctx.*.flags |= c.AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
 
         try applyRateControl(ctx, profile);
 
@@ -84,9 +88,10 @@ pub const VaapiEncoder = struct {
         frame: *const filter_graph.FilteredFrame,
         profile: common.RateControlProfile,
         fps: u32,
+        global_header: bool,
     ) EncoderError!VaapiEncoder {
         const hw_ctx = frame.raw_frame.*.hw_frames_ctx orelse return EncoderError.EncoderOpenFailed;
-        return init(width, height, hw_ctx, profile, fps);
+        return init(width, height, hw_ctx, profile, fps, global_header);
     }
 
     pub fn deinit(self: *VaapiEncoder) void {

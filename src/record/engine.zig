@@ -1,8 +1,8 @@
 const std = @import("std");
-const c = @import("c");
 const common = @import("../common/lib.zig");
 const capture = @import("../capture/lib.zig");
 const encode = @import("../encode/lib.zig");
+const mux = @import("../mux/lib.zig");
 
 pub const RecordError = error{
     WaylandConnectFailed,
@@ -14,8 +14,9 @@ pub const RecordError = error{
     EncoderInitFailed,
     CaptureFailed,
     EncodeFailed,
-    FileOpenFailed,
-    WriteFailed,
+    UnsupportedTarget,
+    MuxInitFailed,
+    MuxWriteFailed,
 };
 
 pub const RecordConfig = struct {
@@ -33,6 +34,8 @@ pub const RecordStats = struct {
     frames_captured: u64 = 0,
     frames_encoded: u64 = 0,
     bytes_written: u64 = 0,
+    packets_dropped: u64 = 0,
+    reconnects: u64 = 0,
     first_keyframe_seen: bool = false,
 };
 
@@ -47,6 +50,13 @@ pub fn selectRateControl(config: RecordConfig) common.RateControlProfile {
         const maxrate = kbps + @max(@as(u32, 1), kbps / 2);
         const bufsize_kb = @max(@as(u32, 1), kbps / 4);
         return common.RateControlProfile.vbr(kbps, maxrate, bufsize_kb);
+    }
+    if (mux.parseTarget(config.output_path)) |target| {
+        if (target.sink_type == .rtmp) {
+            return common.RateControlProfile.vbr(4500, 6750, 1125);
+        }
+    } else |err| {
+        std.log.debug("target rate-control fallback for {s}: {s}", .{ config.output_path, @errorName(err) });
     }
     return common.RateControlProfile.cqp(config.qp);
 }
@@ -89,19 +99,44 @@ fn destroySurfaceSlots(device: *encode.VaapiDevice, slots: *[2]SurfaceSlot) void
     }
 }
 
-fn drainEncoderPackets(encoder: *encode.VaapiEncoder, out_fd: std.posix.fd_t, stats: *RecordStats) !void {
+fn mapMuxError(err: mux.MuxError) (RecordError || error{OutOfMemory}) {
+    return switch (err) {
+        mux.MuxError.OutOfMemory => error.OutOfMemory,
+        mux.MuxError.UnsupportedTarget => error.UnsupportedTarget,
+        mux.MuxError.MuxContextAllocFailed,
+        mux.MuxError.StreamAllocFailed,
+        mux.MuxError.CodecParamsCopyFailed,
+        mux.MuxError.OutputOpenFailed,
+        mux.MuxError.HeaderWriteFailed,
+        => error.MuxInitFailed,
+        mux.MuxError.PacketWriteFailed,
+        mux.MuxError.TrailerWriteFailed,
+        => error.MuxWriteFailed,
+    };
+}
+
+fn drainEncoderPackets(encoder: *encode.VaapiEncoder, sink: *mux.MuxSink, stats: *RecordStats) !void {
     while (try encoder.receivePacket()) |pkt_val| {
         var pkt = pkt_val;
         defer pkt.deinit();
         if (pkt.is_keyframe) stats.first_keyframe_seen = true;
-        const slice = pkt.dataSlice();
-        const written = c.write(out_fd, slice.ptr, slice.len);
-        if (written < 0 or @as(usize, @intCast(written)) != slice.len) {
-            return error.WriteFailed;
-        }
-        stats.bytes_written += pkt.size;
+        sink.writePacket(pkt.raw_packet) catch |err| return mapMuxError(err);
         stats.frames_encoded += 1;
     }
+}
+
+fn syncMuxStats(sink: *const mux.MuxSink, stats: *RecordStats) void {
+    const m = sink.getStats();
+    stats.bytes_written = m.bytes_written;
+    stats.packets_dropped = m.packets_dropped;
+    stats.reconnects = m.reconnects;
+}
+
+fn flushRecording(encoder: *encode.VaapiEncoder, sink: *mux.MuxSink, stats: *RecordStats) !void {
+    encoder.sendFrame(null) catch return error.EncodeFailed;
+    try drainEncoderPackets(encoder, sink, stats);
+    sink.finish() catch |err| return mapMuxError(err);
+    syncMuxStats(sink, stats);
 }
 
 fn isGracefulStop(err: anyerror) bool {
@@ -161,6 +196,7 @@ fn initFirstFrame(
     deadline_ms: ?u64,
     clock: *common.VfrClock,
     config: RecordConfig,
+    global_header: bool,
 ) !struct { filter: encode.VaapiFilterGraph, encoder: encode.VaapiEncoder, first_out: encode.FilteredFrame } {
     const pts_ns = try captureFirstFrameWithRetry(session, device, slots, deadline_ms, config);
     _ = clock.registerFrame(pts_ns);
@@ -184,6 +220,7 @@ fn initFirstFrame(
         &first_out,
         rc,
         config.fps,
+        global_header,
     ) catch return error.EncoderInitFailed;
 
     return .{ .filter = filter, .encoder = encoder, .first_out = first_out };
@@ -198,7 +235,7 @@ const RecordingContext = struct {
     clock: *common.VfrClock,
     config: *const RecordConfig,
     deadline_ms: ?u64,
-    out_fd: std.posix.fd_t,
+    sink: *mux.MuxSink,
     stats: *RecordStats,
 };
 
@@ -238,7 +275,7 @@ fn processFrame(ctx: *RecordingContext, slot: *const SurfaceSlot) !void {
     defer out_frame.deinit();
 
     ctx.encoder.sendFrame(&out_frame) catch return error.EncodeFailed;
-    try drainEncoderPackets(ctx.encoder, ctx.out_fd, ctx.stats);
+    try drainEncoderPackets(ctx.encoder, ctx.sink, ctx.stats);
 }
 
 fn shouldStop(stats: *const RecordStats, config: *const RecordConfig, deadline_ms: ?u64) bool {
@@ -285,11 +322,8 @@ fn recordLoop(ctx: *RecordingContext) !void {
 pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordStats {
     var stats = RecordStats{};
 
-    const path_z = try allocator.dupeSentinel(u8, config.output_path, 0);
-    defer allocator.free(path_z);
-    const out_fd = c.open(path_z.ptr, c.O_CREAT | c.O_WRONLY | c.O_TRUNC, @as(c_uint, 0o600));
-    if (out_fd < 0) return error.FileOpenFailed;
-    defer _ = c.close(out_fd);
+    var sink = mux.MuxSink.init(allocator, config.output_path) catch |err| return mapMuxError(err);
+    defer sink.deinit();
 
     var session: capture.CopyCaptureSession = .{};
     session.init(allocator, null) catch |err| {
@@ -315,7 +349,15 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
     const start_ms = capture.CopyCaptureSession.monotonicMs();
     const deadline_ms: ?u64 = if (config.duration_secs > 0) start_ms + config.duration_secs * 1000 else null;
 
-    const init_res = initFirstFrame(&session, &device, &slots, deadline_ms, &clock, config) catch |err| {
+    const init_res = initFirstFrame(
+        &session,
+        &device,
+        &slots,
+        deadline_ms,
+        &clock,
+        config,
+        sink.needsGlobalHeader(),
+    ) catch |err| {
         if (isGracefulStop(err)) return stats;
         return err;
     };
@@ -325,12 +367,14 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
     defer encoder.deinit();
     stats.frames_captured += 1;
 
+    sink.openVideoStream(encoder.codec_ctx) catch |err| return mapMuxError(err);
+
     {
         var first_out = init_res.first_out;
         defer first_out.deinit();
         encoder.sendFrame(&first_out) catch return error.EncodeFailed;
     }
-    try drainEncoderPackets(&encoder, out_fd, &stats);
+    try drainEncoderPackets(&encoder, &sink, &stats);
 
     var ctx = RecordingContext{
         .session = &session,
@@ -341,13 +385,11 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
         .clock = &clock,
         .config = &config,
         .deadline_ms = deadline_ms,
-        .out_fd = out_fd,
+        .sink = &sink,
         .stats = &stats,
     };
     try recordLoop(&ctx);
-
-    encoder.sendFrame(null) catch return error.EncodeFailed;
-    try drainEncoderPackets(&encoder, out_fd, &stats);
+    try flushRecording(&encoder, &sink, &stats);
 
     return stats;
 }
@@ -356,16 +398,25 @@ test "RecordStats default values and rate control selection" {
     const stats = RecordStats{};
     try std.testing.expectEqual(@as(u64, 0), stats.frames_captured);
     try std.testing.expectEqual(@as(u64, 0), stats.frames_encoded);
+    try std.testing.expectEqual(@as(u64, 0), stats.packets_dropped);
+    try std.testing.expectEqual(@as(u64, 0), stats.reconnects);
     try std.testing.expectEqual(false, stats.first_keyframe_seen);
 
     const cqp_rc = selectRateControl(.{ .output_path = "a.h264", .qp = 21 });
     try std.testing.expectEqual(common.RateControlProfile.Mode.cqp, cqp_rc.mode);
     try std.testing.expectEqual(@as(u8, 21), cqp_rc.qp);
 
+    const rtmp_rc = selectRateControl(.{ .output_path = "rtmp://127.0.0.1/live/key" });
+    try std.testing.expectEqual(common.RateControlProfile.Mode.vbr, rtmp_rc.mode);
+    try std.testing.expectEqual(@as(u32, 4500), rtmp_rc.bitrate_kbps);
+
     const vbr_rc = selectRateControl(.{ .output_path = "a.h264", .bitrate = 6_000_000 });
     try std.testing.expectEqual(common.RateControlProfile.Mode.vbr, vbr_rc.mode);
     try std.testing.expectEqual(@as(u32, 6000), vbr_rc.bitrate_kbps);
 
+    try std.testing.expectEqual(RecordError.UnsupportedTarget, mapMuxError(mux.MuxError.UnsupportedTarget));
+    try std.testing.expectEqual(RecordError.MuxInitFailed, mapMuxError(mux.MuxError.OutputOpenFailed));
+    try std.testing.expectEqual(RecordError.MuxWriteFailed, mapMuxError(mux.MuxError.TrailerWriteFailed));
     try std.testing.expectEqual(RecordError.UnsupportedFormat, mapVaapiError(encode.VaapiError.UnsupportedFormat));
     try std.testing.expectEqual(RecordError.VaapiInitFailed, mapVaapiError(encode.VaapiError.DeviceCreateFailed));
     try std.testing.expect(isGracefulStop(capture.CaptureError.Timeout));

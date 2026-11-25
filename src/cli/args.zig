@@ -120,7 +120,7 @@ pub fn printUsage(writer: anytype) !void {
         \\  version, -v         Show version information
         \\
         \\Record Options:
-        \\  -o, --output <path>    Output file path (default: output.h264)
+        \\  -o, --output <path>    Output file (.mp4/.mkv/.flv/.h264) or rtmp:// URL (default: output.h264)
         \\  -d, --device <path>    DRM render node path (default: /dev/dri/renderD128)
         \\  -f, --fps <num>        Capture framerate (default: 60)
         \\  -q, --qp <num>         H.264 CQP quantization parameter (default: 23)
