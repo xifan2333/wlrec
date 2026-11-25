@@ -18,7 +18,7 @@ fn monotonicMs() u64 {
 
 fn rtmpInterruptCb(opaque_ptr: ?*anyopaque) callconv(.c) c_int {
     const worker: *RtmpWorker = @ptrCast(@alignCast(opaque_ptr orelse return 0));
-    if (worker.stop_requested.load(.acquire)) return 1;
+    if (worker.stop_requested.load(.acquire) and !worker.flushing_tail.load(.acquire)) return 1;
     const deadline = worker.io_deadline_ms.load(.acquire);
     if (deadline > 0 and monotonicMs() >= deadline) return 1;
     return 0;
@@ -37,6 +37,15 @@ const RtmpConnection = struct {
         }
         c.avformat_free_context(self.fmt_ctx);
     }
+};
+
+const ReconnectState = struct {
+    conn: ?RtmpConnection = null,
+    next_connect_ms: u64 = 0,
+    backoff_ms: u64 = initial_backoff_ms,
+    had_connected: bool = false,
+    wait_for_keyframe: bool = true,
+    last_drop_seq: u64 = 0,
 };
 
 /// Evaluate whether a packet must be dropped while waiting for the next IDR keyframe.
@@ -63,6 +72,7 @@ pub const RtmpWorker = struct {
 
     queue: common.SpscRingBuffer(*c.AVPacket, queue_capacity) = .init(),
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    flushing_tail: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     io_deadline_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     push_drop_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -255,11 +265,23 @@ pub const RtmpWorker = struct {
         return true;
     }
 
-    fn flushConnectedTail(self: *RtmpWorker, conn: *RtmpConnection, wait_for_keyframe: *bool) void {
+    fn syncDropGate(self: *const RtmpWorker, state: *ReconnectState) void {
+        const cur_drop_seq = self.push_drop_seq.load(.acquire);
+        if (cur_drop_seq != state.last_drop_seq) {
+            state.last_drop_seq = cur_drop_seq;
+            state.wait_for_keyframe = true;
+        }
+    }
+
+    fn flushConnectedTail(self: *RtmpWorker, conn: *RtmpConnection, state: *ReconnectState) void {
+        self.flushing_tail.store(true, .release);
+        defer self.flushing_tail.store(false, .release);
+
         while (self.queue.pop()) |pkt| {
             defer freeRawPacket(pkt);
+            self.syncDropGate(state);
             const is_key = (pkt.*.flags & c.AV_PKT_FLAG_KEY) != 0;
-            if (shouldDropForKeyframe(is_key, wait_for_keyframe)) {
+            if (shouldDropForKeyframe(is_key, &state.wait_for_keyframe)) {
                 _ = self.packets_dropped.fetchAdd(1, .monotonic);
                 continue;
             }
@@ -273,94 +295,75 @@ pub const RtmpWorker = struct {
         self.io_deadline_ms.store(0, .release);
     }
 
-    fn handleDisconnected(
-        self: *RtmpWorker,
-        conn: *?RtmpConnection,
-        next_connect_ms: *u64,
-        backoff_ms: *u64,
-        had_connected: *bool,
-        wait_for_keyframe: *bool,
-    ) void {
-        self.drainRemainingDropped();
+    fn handleDisconnected(self: *RtmpWorker, state: *ReconnectState) void {
         const now = monotonicMs();
-        if (now < next_connect_ms.*) {
-            const wait_ms: i32 = @intCast(@min(@as(u64, 50), next_connect_ms.* - now));
+        if (now < state.next_connect_ms) {
+            self.drainRemainingDropped();
+            const wait_ms: i32 = @intCast(@min(@as(u64, 50), state.next_connect_ms - now));
             self.waitWake(wait_ms);
             return;
         }
         if (self.openConnection()) |new_conn| {
-            conn.* = new_conn;
-            wait_for_keyframe.* = true;
-            backoff_ms.* = initial_backoff_ms;
-            if (had_connected.*) {
+            state.conn = new_conn;
+            state.wait_for_keyframe = true;
+            state.backoff_ms = initial_backoff_ms;
+            if (state.had_connected) {
                 _ = self.reconnects.fetchAdd(1, .monotonic);
             }
-            had_connected.* = true;
+            state.had_connected = true;
             return;
         }
-        next_connect_ms.* = monotonicMs() + backoff_ms.*;
-        backoff_ms.* = @min(backoff_ms.* * 2, max_backoff_ms);
+        self.drainRemainingDropped();
+        state.wait_for_keyframe = true;
+        state.next_connect_ms = monotonicMs() + state.backoff_ms;
+        state.backoff_ms = @min(state.backoff_ms * 2, max_backoff_ms);
     }
 
-    fn processNextPacket(
-        self: *RtmpWorker,
-        conn_opt: *?RtmpConnection,
-        wait_for_keyframe: *bool,
-        last_drop_seq: *u64,
-        next_connect_ms: *u64,
-        backoff_ms: *u64,
-    ) void {
+    fn processNextPacket(self: *RtmpWorker, state: *ReconnectState) void {
         const pkt = self.queue.pop() orelse {
             self.waitWake(50);
             return;
         };
         defer freeRawPacket(pkt);
 
-        const cur_drop_seq = self.push_drop_seq.load(.acquire);
-        if (cur_drop_seq != last_drop_seq.*) {
-            last_drop_seq.* = cur_drop_seq;
-            wait_for_keyframe.* = true;
-        }
+        self.syncDropGate(state);
 
         const is_key = (pkt.*.flags & c.AV_PKT_FLAG_KEY) != 0;
-        if (shouldDropForKeyframe(is_key, wait_for_keyframe)) {
+        if (shouldDropForKeyframe(is_key, &state.wait_for_keyframe)) {
             _ = self.packets_dropped.fetchAdd(1, .monotonic);
             return;
         }
 
-        var conn = conn_opt.*.?;
+        var conn = state.conn.?;
         if (self.writeOnePacket(&conn, pkt)) {
-            backoff_ms.* = initial_backoff_ms;
+            state.backoff_ms = initial_backoff_ms;
             return;
         }
 
         conn.close(false);
-        conn_opt.* = null;
+        state.conn = null;
         _ = self.packets_dropped.fetchAdd(1, .monotonic);
-        wait_for_keyframe.* = true;
-        next_connect_ms.* = monotonicMs() + backoff_ms.*;
-        backoff_ms.* = @min(backoff_ms.* * 2, max_backoff_ms);
+        state.wait_for_keyframe = true;
+        state.next_connect_ms = monotonicMs() + state.backoff_ms;
+        state.backoff_ms = @min(state.backoff_ms * 2, max_backoff_ms);
     }
 
     fn workerLoop(self: *RtmpWorker) void {
-        var conn: ?RtmpConnection = null;
-        var next_connect_ms: u64 = 0;
-        var backoff_ms: u64 = initial_backoff_ms;
-        var had_connected = false;
-        var wait_for_keyframe = true;
-        var last_drop_seq = self.push_drop_seq.load(.acquire);
+        var state = ReconnectState{
+            .last_drop_seq = self.push_drop_seq.load(.acquire),
+        };
 
         while (!self.stop_requested.load(.acquire)) {
-            if (conn == null) {
-                self.handleDisconnected(&conn, &next_connect_ms, &backoff_ms, &had_connected, &wait_for_keyframe);
+            if (state.conn == null) {
+                self.handleDisconnected(&state);
                 continue;
             }
-            self.processNextPacket(&conn, &wait_for_keyframe, &last_drop_seq, &next_connect_ms, &backoff_ms);
+            self.processNextPacket(&state);
         }
 
-        if (conn) |*active| {
-            self.flushConnectedTail(active, &wait_for_keyframe);
-            conn = null;
+        if (state.conn) |*active| {
+            self.flushConnectedTail(active, &state);
+            state.conn = null;
         }
         self.drainRemainingDropped();
     }

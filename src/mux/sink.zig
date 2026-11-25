@@ -76,6 +76,7 @@ pub const MuxSink = struct {
     target_z: [:0]u8,
     target_info: MuxTarget,
     fmt_ctx: ?*c.AVFormatContext = null,
+    scratch_pkt: ?*c.AVPacket = null,
     video_stream: ?*c.AVStream = null,
     src_time_base: c.AVRational = .{ .num = 1, .den = 1000 },
     header_written: bool = false,
@@ -90,8 +91,13 @@ pub const MuxSink = struct {
         errdefer allocator.free(target_z);
 
         var fmt_ctx: ?*c.AVFormatContext = null;
-        if (c.avformat_alloc_output_context2(&fmt_ctx, null, target_info.format_name.ptr, target_z.ptr) < 0 or fmt_ctx == null) {
-            return MuxError.MuxContextAllocFailed;
+        var scratch_pkt: ?*c.AVPacket = null;
+        if (target_info.sink_type == .file) {
+            if (c.avformat_alloc_output_context2(&fmt_ctx, null, target_info.format_name.ptr, target_z.ptr) < 0 or fmt_ctx == null) {
+                return MuxError.MuxContextAllocFailed;
+            }
+            errdefer if (fmt_ctx) |ctx| c.avformat_free_context(ctx);
+            scratch_pkt = c.av_packet_alloc() orelse return MuxError.OutOfMemory;
         }
 
         return .{
@@ -99,11 +105,13 @@ pub const MuxSink = struct {
             .target_z = target_z,
             .target_info = target_info,
             .fmt_ctx = fmt_ctx,
+            .scratch_pkt = scratch_pkt,
         };
     }
 
     /// Return true when the container requires AV_CODEC_FLAG_GLOBAL_HEADER before avcodec_open2.
     pub fn needsGlobalHeader(self: *const MuxSink) bool {
+        if (self.target_info.sink_type == .rtmp) return true;
         const ctx = self.fmt_ctx orelse return false;
         return (ctx.*.oformat.*.flags & c.AVFMT_GLOBALHEADER) != 0;
     }
@@ -111,10 +119,6 @@ pub const MuxSink = struct {
     /// Create the video stream from an opened encoder context, open the output, and write the header.
     pub fn openVideoStream(self: *MuxSink, codec_ctx: *const c.AVCodecContext) MuxError!void {
         if (self.target_info.sink_type == .rtmp) {
-            if (self.fmt_ctx) |ctx| {
-                c.avformat_free_context(ctx);
-                self.fmt_ctx = null;
-            }
             const worker = try rtmp.RtmpWorker.init(self.allocator, self.target_z, codec_ctx);
             errdefer worker.deinit();
             try worker.start();
@@ -160,15 +164,13 @@ pub const MuxSink = struct {
 
         const ctx = self.fmt_ctx orelse return MuxError.PacketWriteFailed;
         const stream = self.video_stream orelse return MuxError.PacketWriteFailed;
+        const out_pkt = self.scratch_pkt orelse return MuxError.PacketWriteFailed;
         if (!self.header_written) return MuxError.PacketWriteFailed;
-
-        const out_pkt = c.av_packet_alloc() orelse return MuxError.OutOfMemory;
-        var owned: ?*c.AVPacket = out_pkt;
-        defer c.av_packet_free(&owned);
 
         if (c.av_packet_ref(out_pkt, raw_pkt) < 0) {
             return MuxError.PacketWriteFailed;
         }
+        defer c.av_packet_unref(out_pkt);
 
         c.av_packet_rescale_ts(out_pkt, self.src_time_base, stream.*.time_base);
         out_pkt.*.stream_index = stream.*.index;
@@ -220,6 +222,11 @@ pub const MuxSink = struct {
         if (self.rtmp_worker) |worker| {
             worker.deinit();
             self.rtmp_worker = null;
+        }
+        if (self.scratch_pkt) |pkt| {
+            var owned: ?*c.AVPacket = pkt;
+            c.av_packet_free(&owned);
+            self.scratch_pkt = null;
         }
         if (self.fmt_ctx) |ctx| {
             c.avformat_free_context(ctx);
