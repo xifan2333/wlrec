@@ -1,6 +1,9 @@
 const std = @import("std");
 const c = @import("c");
 const common = @import("../common/lib.zig");
+const filter_graph = @import("filter_graph.zig");
+
+const averror_eagain: c_int = -@as(c_int, @backingInt(std.posix.E.AGAIN));
 
 pub const EncoderError = error{
     EncoderNotFound,
@@ -16,6 +19,10 @@ pub const EncodedPacket = struct {
     size: usize,
     is_keyframe: bool,
     raw_packet: *c.AVPacket,
+
+    pub fn dataSlice(self: *const EncodedPacket) []const u8 {
+        return self.raw_packet.*.data[0..self.size];
+    }
 
     pub fn deinit(self: *EncodedPacket) void {
         var p = @as(?*c.AVPacket, self.raw_packet);
@@ -57,7 +64,7 @@ pub const VaapiEncoder = struct {
         ctx.*.hw_frames_ctx = c.av_buffer_ref(hw_frames_ctx);
         ctx.*.max_b_frames = 0; // Disable B-frames for minimal latency
 
-        applyRateControl(ctx, profile);
+        try applyRateControl(ctx, profile);
 
         if (c.avcodec_open2(ctx, codec, null) < 0) {
             return EncoderError.EncoderOpenFailed;
@@ -70,18 +77,34 @@ pub const VaapiEncoder = struct {
         };
     }
 
+    /// Initialize an encoder targeting the hardware frames context carried by a filtered frame.
+    pub fn initFromFilteredFrame(
+        width: u32,
+        height: u32,
+        frame: *const filter_graph.FilteredFrame,
+        profile: common.RateControlProfile,
+        fps: u32,
+    ) EncoderError!VaapiEncoder {
+        const hw_ctx = frame.raw_frame.*.hw_frames_ctx orelse return EncoderError.EncoderOpenFailed;
+        return init(width, height, hw_ctx, profile, fps);
+    }
+
     pub fn deinit(self: *VaapiEncoder) void {
         var ctx: ?*c.AVCodecContext = self.codec_ctx;
         c.avcodec_free_context(&ctx);
     }
 
-    fn applyRateControl(ctx: *c.AVCodecContext, profile: common.RateControlProfile) void {
+    fn applyRateControl(ctx: *c.AVCodecContext, profile: common.RateControlProfile) EncoderError!void {
         const rc_str = profile.getFfmpegRcMode();
-        _ = c.av_opt_set(ctx.*.priv_data, "rc_mode", rc_str.ptr, 0);
+        if (c.av_opt_set(ctx.*.priv_data, "rc_mode", rc_str.ptr, 0) < 0) {
+            return EncoderError.EncoderOpenFailed;
+        }
 
         switch (profile.mode) {
             .cqp => {
-                _ = c.av_opt_set_int(ctx.*.priv_data, "qp", profile.qp, 0);
+                if (c.av_opt_set_int(ctx.*.priv_data, "qp", profile.qp, 0) < 0) {
+                    return EncoderError.EncoderOpenFailed;
+                }
             },
             .vbr, .cbr => {
                 ctx.*.bit_rate = @as(i64, profile.bitrate_kbps) * 1000;
@@ -92,9 +115,10 @@ pub const VaapiEncoder = struct {
         }
     }
 
-    /// Submit a hardware frame to the encoder. Pass null to flush the encoder.
-    pub fn sendFrame(self: *VaapiEncoder, frame: ?*const c.AVFrame) EncoderError!void {
-        const ret = c.avcodec_send_frame(self.codec_ctx, frame);
+    /// Submit a filtered hardware frame to the encoder. Pass null to flush the encoder.
+    pub fn sendFrame(self: *VaapiEncoder, frame: ?*const filter_graph.FilteredFrame) EncoderError!void {
+        const raw: ?*const c.AVFrame = if (frame) |f| f.raw_frame else null;
+        const ret = c.avcodec_send_frame(self.codec_ctx, raw);
         if (ret < 0) return EncoderError.SendFrameFailed;
     }
 
@@ -107,7 +131,7 @@ pub const VaapiEncoder = struct {
         }
 
         const ret = c.avcodec_receive_packet(self.codec_ctx, pkt);
-        if (ret == -11 or ret == c.AVERROR_EOF) {
+        if (ret == averror_eagain or ret == c.AVERROR_EOF) {
             var p = @as(?*c.AVPacket, pkt);
             c.av_packet_free(&p);
             return null;

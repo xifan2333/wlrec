@@ -94,7 +94,7 @@ fn drainEncoderPackets(encoder: *encode.VaapiEncoder, out_fd: std.posix.fd_t, st
         var pkt = pkt_val;
         defer pkt.deinit();
         if (pkt.is_keyframe) stats.first_keyframe_seen = true;
-        const slice = pkt.raw_packet.*.data[0..pkt.size];
+        const slice = pkt.dataSlice();
         const written = c.write(out_fd, slice.ptr, slice.len);
         if (written < 0 or @as(usize, @intCast(written)) != slice.len) {
             return error.WriteFailed;
@@ -159,7 +159,7 @@ fn initFirstFrame(
     deadline_ms: ?u64,
     clock: *common.VfrClock,
     config: RecordConfig,
-) !struct { filter: encode.VaapiFilterGraph, encoder: encode.VaapiEncoder, first_out: *c.AVFrame } {
+) !struct { filter: encode.VaapiFilterGraph, encoder: encode.VaapiEncoder, first_out: encode.FilteredFrame } {
     const pts_ns = try captureFirstFrameWithRetry(session, device, slots, deadline_ms, config);
     _ = clock.registerFrame(pts_ns);
 
@@ -172,18 +172,14 @@ fn initFirstFrame(
     ) catch return error.FilterInitFailed;
     errdefer filter.deinit();
 
-    const first_out = filter.filterSurface(slots[0].surface.surface_id, 0) catch return error.FilterInitFailed;
-    errdefer {
-        var f: ?*c.AVFrame = first_out;
-        c.av_frame_free(&f);
-    }
+    var first_out = filter.filterSurface(slots[0].surface.surface_id, 0) catch return error.FilterInitFailed;
+    errdefer first_out.deinit();
 
     const rc = selectRateControl(config);
-    const hw_ctx = first_out.*.hw_frames_ctx orelse return error.EncoderInitFailed;
-    const encoder = encode.VaapiEncoder.init(
+    const encoder = encode.VaapiEncoder.initFromFilteredFrame(
         enc_dims.width,
         enc_dims.height,
-        hw_ctx,
+        &first_out,
         rc,
         config.fps,
     ) catch return error.EncoderInitFailed;
@@ -204,18 +200,20 @@ const RecordingContext = struct {
     stats: *RecordStats,
 };
 
-fn rebindCapturePipeline(ctx: *RecordingContext) !void {
-    try rebindDeviceAndSlots(ctx.session, ctx.device, ctx.slots, ctx.config.stop_fd, ctx.deadline_ms);
-
-    const new_filter = encode.VaapiFilterGraph.init(
+fn reinitFilter(ctx: *RecordingContext) encode.FilterError!void {
+    const new_filter = try encode.VaapiFilterGraph.init(
         ctx.device,
         ctx.encoder.width,
         ctx.encoder.height,
         ctx.session.frame_transform,
-    ) catch return error.FilterInitFailed;
-
+    );
     ctx.filter.deinit();
     ctx.filter.* = new_filter;
+}
+
+fn rebindCapturePipeline(ctx: *RecordingContext) !void {
+    try rebindDeviceAndSlots(ctx.session, ctx.device, ctx.slots, ctx.config.stop_fd, ctx.deadline_ms);
+    reinitFilter(ctx) catch return error.FilterInitFailed;
 }
 
 fn processFrame(ctx: *RecordingContext, slot: *const SurfaceSlot) !void {
@@ -227,25 +225,17 @@ fn processFrame(ctx: *RecordingContext, slot: *const SurfaceSlot) !void {
     if (ctx.clock.shouldDrop(pts_ns)) return;
 
     if (ctx.session.frame_transform != ctx.filter.wl_transform) {
-        const new_filter = encode.VaapiFilterGraph.init(
-            ctx.device,
-            ctx.encoder.width,
-            ctx.encoder.height,
-            ctx.session.frame_transform,
-        ) catch return error.EncodeFailed;
-        ctx.filter.deinit();
-        ctx.filter.* = new_filter;
+        reinitFilter(ctx) catch return error.EncodeFailed;
     }
 
     ctx.stats.frames_captured += 1;
     const rel_pts_ns = ctx.clock.registerFrame(pts_ns);
     const pts_ms = common.VfrClock.rescaleNs(rel_pts_ns, 1, 1000);
 
-    const out_frame = ctx.filter.filterSurface(slot.surface.surface_id, pts_ms) catch return error.EncodeFailed;
-    var out_f: ?*c.AVFrame = out_frame;
-    defer c.av_frame_free(&out_f);
+    var out_frame = ctx.filter.filterSurface(slot.surface.surface_id, pts_ms) catch return error.EncodeFailed;
+    defer out_frame.deinit();
 
-    ctx.encoder.sendFrame(out_frame) catch return error.EncodeFailed;
+    ctx.encoder.sendFrame(&out_frame) catch return error.EncodeFailed;
     try drainEncoderPackets(ctx.encoder, ctx.out_fd, ctx.stats);
 }
 
@@ -330,9 +320,9 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
     stats.frames_captured += 1;
 
     {
-        var first_f: ?*c.AVFrame = init_res.first_out;
-        defer c.av_frame_free(&first_f);
-        encoder.sendFrame(init_res.first_out) catch return error.EncodeFailed;
+        var first_out = init_res.first_out;
+        defer first_out.deinit();
+        encoder.sendFrame(&first_out) catch return error.EncodeFailed;
     }
     try drainEncoderPackets(&encoder, out_fd, &stats);
 

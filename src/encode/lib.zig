@@ -8,6 +8,7 @@ pub const SurfacePlane = vaapi_device.SurfacePlane;
 pub const VaapiError = vaapi_device.VaapiError;
 
 pub const VaapiFilterGraph = filter_graph.VaapiFilterGraph;
+pub const FilteredFrame = filter_graph.FilteredFrame;
 pub const FilterError = filter_graph.FilterError;
 
 pub const VaapiEncoder = encoder.VaapiEncoder;

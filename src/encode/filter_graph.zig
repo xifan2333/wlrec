@@ -16,6 +16,15 @@ pub const FilterError = error{
     PullFrameFailed,
 };
 
+pub const FilteredFrame = struct {
+    raw_frame: *c.AVFrame,
+
+    pub fn deinit(self: *FilteredFrame) void {
+        var f: ?*c.AVFrame = self.raw_frame;
+        c.av_frame_free(&f);
+    }
+};
+
 fn dummyFree(opaque_ptr: ?*anyopaque, data: [*c]u8) callconv(.c) void {
     _ = opaque_ptr;
     _ = data;
@@ -142,11 +151,13 @@ pub const VaapiFilterGraph = struct {
         if (c.avfilter_link(scale_ctx, 0, out_ctx.?, 0) < 0) return FilterError.LinkFailed;
         if (c.avfilter_graph_config(graph.?, null) < 0) return FilterError.GraphConfigFailed;
 
+        const owned_frames_ref = c.av_buffer_ref(device.in_frames_ref) orelse return FilterError.FrameAllocFailed;
+
         return .{
             .graph = graph.?,
             .in_ctx = in_ctx,
             .out_ctx = out_ctx.?,
-            .in_frames_ref = device.in_frames_ref,
+            .in_frames_ref = owned_frames_ref,
             .in_width = device.width,
             .in_height = device.height,
             .out_width = out_width,
@@ -158,11 +169,12 @@ pub const VaapiFilterGraph = struct {
     pub fn deinit(self: *VaapiFilterGraph) void {
         var g: ?*c.AVFilterGraph = self.graph;
         c.avfilter_graph_free(&g);
+        var fr: ?*c.AVBufferRef = self.in_frames_ref;
+        c.av_buffer_unref(&fr);
     }
 
-    /// Process a VAAPI RGB surface through the GPU filter graph and return an NV12 AVFrame.
-    /// Caller owns the returned AVFrame and must release it with av_frame_free.
-    pub fn filterSurface(self: *VaapiFilterGraph, surface_id: c.VASurfaceID, pts_ms: i64) FilterError!*c.AVFrame {
+    /// Process a VAAPI RGB surface through the GPU filter graph and return an owned NV12 FilteredFrame.
+    pub fn filterSurface(self: *VaapiFilterGraph, surface_id: c.VASurfaceID, pts_ms: i64) FilterError!FilteredFrame {
         const in_frame = c.av_frame_alloc() orelse return FilterError.FrameAllocFailed;
         var in_f: ?*c.AVFrame = in_frame;
         defer c.av_frame_free(&in_f);
@@ -187,7 +199,7 @@ pub const VaapiFilterGraph = struct {
             return FilterError.PullFrameFailed;
         }
 
-        return out_frame;
+        return .{ .raw_frame = out_frame };
     }
 };
 
