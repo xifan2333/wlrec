@@ -19,7 +19,32 @@ pub const CaptureError = error{
 
 pub const FormatModifierPair = common.FormatModifierPair;
 
-const max_format_pairs = 128;
+pub const WaylandCapabilities = struct {
+    wayland_ok: bool = false,
+    copy_capture_ok: bool = false,
+    source_mgr_ok: bool = false,
+    dmabuf_ok: bool = false,
+};
+
+const max_format_pairs = 256;
+
+const supported_drm_formats = [_]u32{
+    c.DRM_FORMAT_ARGB8888,
+    c.DRM_FORMAT_XRGB8888,
+    c.DRM_FORMAT_ABGR8888,
+    c.DRM_FORMAT_XBGR8888,
+};
+
+pub fn isSupportedRgbDrmFormat(format: u32) bool {
+    for (supported_drm_formats) |supported| {
+        if (format == supported) return true;
+    }
+    return false;
+}
+
+pub fn isSupportedDmabufVersion(ver: u32) bool {
+    return ver >= 2;
+}
 
 /// Active Wayland zero-copy screen capture session.
 pub const CopyCaptureSession = struct {
@@ -117,10 +142,63 @@ pub const CopyCaptureSession = struct {
         return self.formats[0..self.format_count];
     }
 
-    fn beginConstraintBatch(self: *CopyCaptureSession) void {
+    pub fn beginConstraintBatch(self: *CopyCaptureSession) void {
         if (self.session_done) {
             self.session_done = false;
             self.format_count = 0;
+        }
+    }
+
+    pub fn recordBufferSize(self: *CopyCaptureSession, width: u32, height: u32) void {
+        self.beginConstraintBatch();
+        self.width = width;
+        self.height = height;
+    }
+
+    pub fn recordShmFormat(self: *CopyCaptureSession) void {
+        self.beginConstraintBatch();
+    }
+
+    pub fn recordDmabufDevice(self: *CopyCaptureSession, major: u32, minor: u32) void {
+        self.beginConstraintBatch();
+        self.device_major = major;
+        self.device_minor = minor;
+    }
+
+    fn appendUniqueFormatPair(self: *CopyCaptureSession, format: u32, modifier: u64) void {
+        for (self.formats[0..self.format_count]) |existing| {
+            if (existing.format == format and existing.modifier == modifier) return;
+        }
+        if (self.format_count < max_format_pairs) {
+            self.formats[self.format_count] = .{ .format = format, .modifier = modifier };
+            self.format_count += 1;
+        }
+    }
+
+    pub fn recordDmabufFormat(self: *CopyCaptureSession, format: u32, modifiers: []const u64) void {
+        self.beginConstraintBatch();
+        if (!isSupportedRgbDrmFormat(format)) return;
+
+        if (modifiers.len == 0) {
+            self.appendUniqueFormatPair(format, common.drm_mod_invalid);
+            return;
+        }
+        for (modifiers) |mod| {
+            self.appendUniqueFormatPair(format, mod);
+        }
+    }
+
+    pub fn markSessionDone(self: *CopyCaptureSession) void {
+        self.session_done = true;
+    }
+
+    pub fn markSessionStopped(self: *CopyCaptureSession) void {
+        self.session_stopped = true;
+    }
+
+    pub fn validateBufferDimensions(self: *const CopyCaptureSession, width: u32, height: u32) CaptureError!void {
+        if (width != self.width or height != self.height) {
+            return CaptureError.BufferConstraints;
         }
     }
 
@@ -191,9 +269,7 @@ pub const CopyCaptureSession = struct {
         const sess = self.session orelse return CaptureError.SessionStopped;
 
         try self.waitConstraints(stop_fd, deadline_ms);
-        if (dmabuf_buf.width != self.width or dmabuf_buf.height != self.height) {
-            return CaptureError.BufferConstraints;
-        }
+        try self.validateBufferDimensions(dmabuf_buf.width, dmabuf_buf.height);
         _ = try remainingTimeoutMs(deadline_ms);
 
         self.frame_ready = false;
@@ -246,7 +322,9 @@ fn registryGlobal(data: ?*anyopaque, reg: ?*c.wl_registry, name: u32, iface: [*c
         return;
     }
     if (std.mem.eql(u8, span, "zwp_linux_dmabuf_v1")) {
-        self.dmabuf = @ptrCast(c.wl_registry_bind(reg, name, &c.zwp_linux_dmabuf_v1_interface, @min(ver, 4)));
+        if (isSupportedDmabufVersion(ver)) {
+            self.dmabuf = @ptrCast(c.wl_registry_bind(reg, name, &c.zwp_linux_dmabuf_v1_interface, @min(ver, 4)));
+        }
         return;
     }
 }
@@ -262,69 +340,99 @@ const registry_listener = c.wl_registry_listener{
     .global_remove = registryGlobalRemove,
 };
 
+fn probeRegistryGlobal(data: ?*anyopaque, reg: ?*c.wl_registry, name: u32, iface: [*c]const u8, ver: u32) callconv(.c) void {
+    _ = reg;
+    _ = name;
+    const caps: *WaylandCapabilities = @ptrCast(@alignCast(data));
+    const span = std.mem.span(iface);
+    if (std.mem.eql(u8, span, "ext_image_copy_capture_manager_v1")) caps.copy_capture_ok = true;
+    if (std.mem.eql(u8, span, "ext_output_image_capture_source_manager_v1")) caps.source_mgr_ok = true;
+    if (std.mem.eql(u8, span, "zwp_linux_dmabuf_v1") and isSupportedDmabufVersion(ver)) caps.dmabuf_ok = true;
+}
+
+const probe_registry_listener = c.wl_registry_listener{
+    .global = probeRegistryGlobal,
+    .global_remove = registryGlobalRemove,
+};
+
+/// Probe Wayland display connectivity and required capture/dmabuf globals.
+pub fn probeWaylandCapabilities(wayland_display: ?[*:0]const u8) WaylandCapabilities {
+    var caps = WaylandCapabilities{};
+    const dpy = c.wl_display_connect(wayland_display) orelse return caps;
+    defer c.wl_display_disconnect(dpy);
+    caps.wayland_ok = true;
+
+    const reg = c.wl_display_get_registry(dpy) orelse return caps;
+    defer c.wl_registry_destroy(reg);
+
+    _ = c.wl_registry_add_listener(reg, &probe_registry_listener, &caps);
+    _ = c.wl_display_roundtrip(dpy);
+    return caps;
+}
+
 fn sessionBufferSize(data: ?*anyopaque, sess: ?*c.ext_image_copy_capture_session_v1, w: u32, h: u32) callconv(.c) void {
     _ = sess;
     const self: *CopyCaptureSession = @ptrCast(@alignCast(data));
-    self.beginConstraintBatch();
-    self.width = w;
-    self.height = h;
+    self.recordBufferSize(w, h);
 }
 
 fn sessionShmFormat(data: ?*anyopaque, sess: ?*c.ext_image_copy_capture_session_v1, format: u32) callconv(.c) void {
     _ = sess;
     _ = format;
     const self: *CopyCaptureSession = @ptrCast(@alignCast(data));
-    self.beginConstraintBatch();
+    self.recordShmFormat();
 }
 
 fn sessionDmabufDevice(data: ?*anyopaque, sess: ?*c.ext_image_copy_capture_session_v1, dev_array: [*c]c.wl_array) callconv(.c) void {
     _ = sess;
     const self: *CopyCaptureSession = @ptrCast(@alignCast(data));
-    self.beginConstraintBatch();
-    if (dev_array.*.size >= @sizeOf(c.dev_t) and dev_array.*.data != null) {
-        var dev: c.dev_t = 0;
-        const src: [*]const u8 = @ptrCast(dev_array.*.data);
-        @memcpy(std.mem.asBytes(&dev), src[0..@sizeOf(c.dev_t)]);
-        self.device_major = @intCast(((dev >> 8) & 0xfff) | ((dev >> 32) & ~@as(c.dev_t, 0xfff)));
-        self.device_minor = @intCast((dev & 0xff) | ((dev >> 12) & ~@as(c.dev_t, 0xff)));
+    if (dev_array == null or dev_array.*.size < @sizeOf(c.dev_t) or dev_array.*.data == null) {
+        self.recordShmFormat();
+        return;
     }
+
+    var dev: c.dev_t = 0;
+    const src: [*]const u8 = @ptrCast(dev_array.*.data);
+    @memcpy(std.mem.asBytes(&dev), src[0..@sizeOf(c.dev_t)]);
+    const major: u32 = @intCast(((dev >> 8) & 0xfff) | ((dev >> 32) & ~@as(c.dev_t, 0xfff)));
+    const minor: u32 = @intCast((dev & 0xff) | ((dev >> 12) & ~@as(c.dev_t, 0xff)));
+    self.recordDmabufDevice(major, minor);
 }
 
 fn sessionDmabufFormat(data: ?*anyopaque, sess: ?*c.ext_image_copy_capture_session_v1, format: u32, modifiers: [*c]c.wl_array) callconv(.c) void {
     _ = sess;
     const self: *CopyCaptureSession = @ptrCast(@alignCast(data));
-    self.beginConstraintBatch();
 
     if (modifiers == null or modifiers.*.data == null or modifiers.*.size < @sizeOf(u64)) {
-        if (self.format_count < max_format_pairs) {
-            self.formats[self.format_count] = .{ .format = format, .modifier = common.drm_mod_invalid };
-            self.format_count += 1;
-        }
+        self.recordDmabufFormat(format, &.{});
         return;
     }
 
-    const count = modifiers.*.size / @sizeOf(u64);
+    const total = modifiers.*.size / @sizeOf(u64);
     const bytes: [*]const u8 = @ptrCast(modifiers.*.data);
-    var i: usize = 0;
-    while (i < count and self.format_count < max_format_pairs) : (i += 1) {
-        var mod: u64 = 0;
-        const off = i * @sizeOf(u64);
-        @memcpy(std.mem.asBytes(&mod), bytes[off .. off + @sizeOf(u64)]);
-        self.formats[self.format_count] = .{ .format = format, .modifier = mod };
-        self.format_count += 1;
+    var chunk: [64]u64 = undefined;
+    var offset: usize = 0;
+    while (offset < total) {
+        const chunk_len = @min(total - offset, chunk.len);
+        for (0..chunk_len) |i| {
+            const byte_off = (offset + i) * @sizeOf(u64);
+            @memcpy(std.mem.asBytes(&chunk[i]), bytes[byte_off .. byte_off + @sizeOf(u64)]);
+        }
+        self.recordDmabufFormat(format, chunk[0..chunk_len]);
+        offset += chunk_len;
     }
 }
 
 fn sessionDone(data: ?*anyopaque, sess: ?*c.ext_image_copy_capture_session_v1) callconv(.c) void {
     _ = sess;
     const self: *CopyCaptureSession = @ptrCast(@alignCast(data));
-    self.session_done = true;
+    self.markSessionDone();
 }
 
 fn sessionStopped(data: ?*anyopaque, sess: ?*c.ext_image_copy_capture_session_v1) callconv(.c) void {
     _ = sess;
     const self: *CopyCaptureSession = @ptrCast(@alignCast(data));
-    self.session_stopped = true;
+    self.markSessionStopped();
 }
 
 const session_listener = c.ext_image_copy_capture_session_v1_listener{
@@ -385,4 +493,33 @@ test "CopyCaptureSession struct initialization and deadline math" {
     try std.testing.expectEqual(@as(usize, 0), sess.advertisedFormats().len);
     try std.testing.expectEqual(@as(i32, -1), try CopyCaptureSession.remainingTimeoutMs(null));
     try std.testing.expectError(CaptureError.Timeout, CopyCaptureSession.remainingTimeoutMs(0));
+    try std.testing.expect(!isSupportedDmabufVersion(1));
+    try std.testing.expect(isSupportedDmabufVersion(2));
+}
+
+test "CopyCaptureSession constraint retention filters non-RGB formats and resets batches" {
+    var sess = CopyCaptureSession{};
+    sess.recordBufferSize(1920, 1080);
+
+    var nv12_mods: [150]u64 = undefined;
+    for (&nv12_mods, 0..) |*m, idx| m.* = @intCast(idx + 1);
+    sess.recordDmabufFormat(c.DRM_FORMAT_NV12, &nv12_mods);
+    sess.recordDmabufFormat(c.DRM_FORMAT_XRGB8888, &.{ common.drm_mod_linear, common.drm_mod_linear });
+    sess.markSessionDone();
+
+    try std.testing.expectEqual(@as(usize, 1), sess.advertisedFormats().len);
+    try std.testing.expectEqual(c.DRM_FORMAT_XRGB8888, sess.advertisedFormats()[0].format);
+    try std.testing.expectEqual(common.drm_mod_linear, sess.advertisedFormats()[0].modifier);
+    try sess.validateBufferDimensions(1920, 1080);
+
+    // Constraint update after session_done clears previous formats and invalidates old buffer dimensions
+    sess.recordBufferSize(1280, 720);
+    try std.testing.expectEqual(@as(usize, 0), sess.advertisedFormats().len);
+    try std.testing.expectError(CaptureError.BufferConstraints, sess.validateBufferDimensions(1920, 1080));
+
+    sess.recordDmabufFormat(c.DRM_FORMAT_ARGB8888, &.{});
+    sess.markSessionDone();
+    try std.testing.expectEqual(@as(usize, 1), sess.advertisedFormats().len);
+    try std.testing.expectEqual(c.DRM_FORMAT_ARGB8888, sess.advertisedFormats()[0].format);
+    try std.testing.expectEqual(common.drm_mod_invalid, sess.advertisedFormats()[0].modifier);
 }

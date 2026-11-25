@@ -89,10 +89,56 @@ const damage_registry_listener = c.wl_registry_listener{
     .global_remove = damageRegistryRemove,
 };
 
+const BufferSlot = struct {
+    buffer: *c.wl_buffer,
+    busy: bool = false,
+};
+
+fn bufferRelease(data: ?*anyopaque, wl_buf: ?*c.wl_buffer) callconv(.c) void {
+    _ = wl_buf;
+    const slot: *BufferSlot = @ptrCast(@alignCast(data));
+    slot.busy = false;
+}
+
+const buffer_listener = c.wl_buffer_listener{ .release = bufferRelease };
+
+fn waitFlagOrStop(
+    dpy: *c.wl_display,
+    flag: *const bool,
+    expect: bool,
+    tctx: *ThreadCtx,
+    max_wait_ms: i32,
+) bool {
+    var waited_ms: i32 = 0;
+    const step_ms: i32 = 25;
+    while (flag.* != expect and !tctx.stop.load(.acquire) and waited_ms < max_wait_ms) {
+        _ = c.wl_display_flush(dpy);
+        if (c.wl_display_prepare_read(dpy) != 0) {
+            if (c.wl_display_dispatch_pending(dpy) < 0) return false;
+            continue;
+        }
+        var pfd = [_]std.posix.pollfd{
+            .{ .fd = c.wl_display_get_fd(dpy), .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const ret = std.posix.poll(&pfd, step_ms) catch {
+            c.wl_display_cancel_read(dpy);
+            return false;
+        };
+        if (ret == 0) {
+            c.wl_display_cancel_read(dpy);
+            waited_ms += step_ms;
+            continue;
+        }
+        if (c.wl_display_read_events(dpy) < 0) return false;
+        if (c.wl_display_dispatch_pending(dpy) < 0) return false;
+    }
+    return flag.* == expect;
+}
+
 fn pumpFrames(
     dpy: *c.wl_display,
     surf: *c.wl_surface,
-    bufs: *[2]*c.wl_buffer,
+    slots: *[2]BufferSlot,
     pixels: [*]volatile u32,
     tctx: *ThreadCtx,
 ) void {
@@ -100,8 +146,11 @@ fn pumpFrames(
     const sleep_ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 25_000_000 };
     while (!tctx.stop.load(.acquire) and step < 160) : (step += 1) {
         const idx: usize = step % 2;
+        if (!waitFlagOrStop(dpy, &slots[idx].busy, false, tctx, 500)) break;
+
         pixels[idx] = 0x01000000 | (step & 0x00ffffff);
-        c.wl_surface_attach(surf, bufs[idx], 0, 0);
+        slots[idx].busy = true;
+        c.wl_surface_attach(surf, slots[idx].buffer, 0, 0);
         c.wl_surface_damage_buffer(surf, 0, 0, 1, 1);
         c.wl_surface_commit(surf);
         _ = c.wl_display_dispatch_pending(dpy);
@@ -160,9 +209,16 @@ fn runDamageGenerator(tctx: *ThreadCtx) void {
 
     c.wl_surface_commit(surf);
     _ = c.wl_display_roundtrip(client.display.?);
+    if (!waitFlagOrStop(client.display.?, &client.configured, true, tctx, 2000)) return;
 
-    var bufs = [2]*c.wl_buffer{ b0, b1 };
-    pumpFrames(client.display.?, surf, &bufs, pixels, tctx);
+    var slots = [2]BufferSlot{
+        .{ .buffer = b0 },
+        .{ .buffer = b1 },
+    };
+    _ = c.wl_buffer_add_listener(slots[0].buffer, &buffer_listener, &slots[0]);
+    _ = c.wl_buffer_add_listener(slots[1].buffer, &buffer_listener, &slots[1]);
+
+    pumpFrames(client.display.?, surf, &slots, pixels, tctx);
 }
 
 test "live desktop zero-copy capture to h264 file" {

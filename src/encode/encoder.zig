@@ -86,7 +86,8 @@ pub const VaapiEncoder = struct {
             .vbr, .cbr => {
                 ctx.*.bit_rate = @as(i64, profile.bitrate_kbps) * 1000;
                 ctx.*.rc_max_rate = @as(i64, profile.maxrate_kbps) * 1000;
-                ctx.*.rc_buffer_size = @as(c_int, @intCast(profile.bufsize_kb)) * 1000 * 8;
+                const buf_bits: i64 = @as(i64, profile.bufsize_kb) * 1000 * 8;
+                ctx.*.rc_buffer_size = @intCast(buf_bits);
             },
         }
     }

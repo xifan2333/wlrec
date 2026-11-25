@@ -8,6 +8,8 @@ pub const DmabufBuffer = dmabuf.DmabufBuffer;
 pub const DmaPlane = dmabuf.DmaPlane;
 pub const CopyCaptureSession = session.CopyCaptureSession;
 pub const FormatModifierPair = session.FormatModifierPair;
+pub const WaylandCapabilities = session.WaylandCapabilities;
+pub const probeWaylandCapabilities = session.probeWaylandCapabilities;
 pub const CaptureError = session.CaptureError;
 
 test {

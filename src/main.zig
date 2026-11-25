@@ -22,6 +22,7 @@ fn handleRecordSubcommand(allocator: std.mem.Allocator, rec_opts: cli.args.Recor
             rec_opts.qp,
         });
     }
+    try stdout.flush();
 
     const dev_z = try allocator.dupeSentinel(u8, rec_opts.device_path, 0);
     defer allocator.free(dev_z);

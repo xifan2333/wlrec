@@ -27,8 +27,6 @@ const supported_rgb_formats = [_]FormatSpec{
     .{ .drm_format = c.DRM_FORMAT_ARGB8888, .va_fourcc = c.VA_FOURCC_BGRA, .sw_format = c.AV_PIX_FMT_BGRA },
     .{ .drm_format = c.DRM_FORMAT_XRGB8888, .va_fourcc = c.VA_FOURCC_XRGB, .sw_format = c.AV_PIX_FMT_BGR0 },
     .{ .drm_format = c.DRM_FORMAT_XRGB8888, .va_fourcc = c.VA_FOURCC_BGRX, .sw_format = c.AV_PIX_FMT_BGR0 },
-    .{ .drm_format = c.DRM_FORMAT_BGRA8888, .va_fourcc = c.VA_FOURCC_BGRA, .sw_format = c.AV_PIX_FMT_BGRA },
-    .{ .drm_format = c.DRM_FORMAT_BGRX8888, .va_fourcc = c.VA_FOURCC_BGRX, .sw_format = c.AV_PIX_FMT_BGR0 },
     .{ .drm_format = c.DRM_FORMAT_ABGR8888, .va_fourcc = c.VA_FOURCC_RGBA, .sw_format = c.AV_PIX_FMT_RGBA },
     .{ .drm_format = c.DRM_FORMAT_XBGR8888, .va_fourcc = c.VA_FOURCC_RGBX, .sw_format = c.AV_PIX_FMT_RGB0 },
 };
@@ -92,10 +90,7 @@ pub fn collectModifiersForFormat(
 pub fn isPairSupported(constraints: []const common.FormatModifierPair, drm_format: u32, modifier: u64) bool {
     if (constraints.len == 0) return true;
     for (constraints) |pair| {
-        if (pair.format != drm_format) continue;
-        if (pair.modifier == modifier or pair.modifier == common.drm_mod_invalid or modifier == common.drm_mod_invalid) {
-            return true;
-        }
+        if (pair.format == drm_format and pair.modifier == modifier) return true;
     }
     return false;
 }
@@ -238,6 +233,25 @@ pub const VaapiDevice = struct {
         return VaapiError.UnsupportedFormat;
     }
 
+    fn createFramesContext(
+        hw_device: *c.AVBufferRef,
+        width: u32,
+        height: u32,
+        sw_format: c_int,
+    ) VaapiError!*c.AVBufferRef {
+        var frames_ref = c.av_hwframe_ctx_alloc(hw_device) orelse return VaapiError.FramesContextAllocFailed;
+        errdefer c.av_buffer_unref(&frames_ref);
+
+        const frames_ctx: *c.AVHWFramesContext = @ptrCast(@alignCast(frames_ref.*.data));
+        frames_ctx.format = c.AV_PIX_FMT_VAAPI;
+        frames_ctx.sw_format = sw_format;
+        frames_ctx.width = @intCast(width);
+        frames_ctx.height = @intCast(height);
+
+        if (c.av_hwframe_ctx_init(frames_ref) < 0) return VaapiError.FramesContextInitFailed;
+        return frames_ref;
+    }
+
     pub fn init(
         device_path: ?[*:0]const u8,
         width: u32,
@@ -257,17 +271,7 @@ pub const VaapiDevice = struct {
 
         var mods: [max_modifiers]u64 = undefined;
         const neg = try negotiateFormat(va_dpy, width, height, constraints, &mods);
-
-        var frames_ref = c.av_hwframe_ctx_alloc(hw_device.?) orelse return VaapiError.FramesContextAllocFailed;
-        errdefer c.av_buffer_unref(&frames_ref);
-
-        const frames_ctx: *c.AVHWFramesContext = @ptrCast(@alignCast(frames_ref.*.data));
-        frames_ctx.format = c.AV_PIX_FMT_VAAPI;
-        frames_ctx.sw_format = neg.spec.sw_format;
-        frames_ctx.width = @intCast(width);
-        frames_ctx.height = @intCast(height);
-
-        if (c.av_hwframe_ctx_init(frames_ref) < 0) return VaapiError.FramesContextInitFailed;
+        const frames_ref = try createFramesContext(hw_device.?, width, height, neg.spec.sw_format);
 
         return .{
             .hw_device_ctx = hw_device.?,
@@ -281,6 +285,28 @@ pub const VaapiDevice = struct {
         };
     }
 
+    /// Reconfigure surface dimensions and format constraints while preserving the same VA display.
+    pub fn reconfigure(
+        self: *VaapiDevice,
+        width: u32,
+        height: u32,
+        constraints: []const common.FormatModifierPair,
+    ) VaapiError!void {
+        var mods: [max_modifiers]u64 = undefined;
+        const neg = try negotiateFormat(self.va_display, width, height, constraints, &mods);
+        const new_frames = try createFramesContext(self.hw_device_ctx, width, height, neg.spec.sw_format);
+
+        var old_frames = @as(?*c.AVBufferRef, self.in_frames_ref);
+        c.av_buffer_unref(&old_frames);
+
+        self.in_frames_ref = new_frames;
+        self.width = width;
+        self.height = height;
+        self.selected_spec = neg.spec;
+        self.modifiers = mods;
+        self.modifier_count = neg.mod_count;
+    }
+
     pub fn deinit(self: *VaapiDevice) void {
         var frames = @as(?*c.AVBufferRef, self.in_frames_ref);
         c.av_buffer_unref(&frames);
@@ -290,7 +316,10 @@ pub const VaapiDevice = struct {
     }
 
     /// Create a negotiated RGB surface and export its multi-plane write-capable DMA-BUF descriptor.
-    pub fn createAndExportSurface(self: *VaapiDevice) VaapiError!ExportedSurface {
+    pub fn createAndExportSurface(
+        self: *VaapiDevice,
+        constraints: []const common.FormatModifierPair,
+    ) VaapiError!ExportedSurface {
         const surf = try createRawSurface(
             self.va_display,
             self.width,
@@ -298,7 +327,7 @@ pub const VaapiDevice = struct {
             self.selected_spec.va_fourcc,
             self.modifiers[0..self.modifier_count],
         );
-        return exportAndValidateSurface(self.va_display, surf, self.selected_spec.drm_format, &.{}) catch |err| {
+        return exportAndValidateSurface(self.va_display, surf, self.selected_spec.drm_format, constraints) catch |err| {
             var s = surf;
             _ = c.vaDestroySurfaces(self.va_display, &s, 1);
             return err;
@@ -311,14 +340,21 @@ pub const VaapiDevice = struct {
 };
 
 test "VaapiDevice format constraint matching" {
-    const constraints = [_]common.FormatModifierPair{
+    const explicit_constraints = [_]common.FormatModifierPair{
         .{ .format = c.DRM_FORMAT_XRGB8888, .modifier = common.drm_mod_linear },
     };
-    try std.testing.expect(isPairSupported(&constraints, c.DRM_FORMAT_XRGB8888, common.drm_mod_linear));
-    try std.testing.expect(!isPairSupported(&constraints, c.DRM_FORMAT_ARGB8888, common.drm_mod_linear));
+    try std.testing.expect(isPairSupported(&explicit_constraints, c.DRM_FORMAT_XRGB8888, common.drm_mod_linear));
+    try std.testing.expect(!isPairSupported(&explicit_constraints, c.DRM_FORMAT_ARGB8888, common.drm_mod_linear));
+    try std.testing.expect(!isPairSupported(&explicit_constraints, c.DRM_FORMAT_XRGB8888, common.drm_mod_invalid));
+
+    const implicit_constraints = [_]common.FormatModifierPair{
+        .{ .format = c.DRM_FORMAT_XRGB8888, .modifier = common.drm_mod_invalid },
+    };
+    try std.testing.expect(isPairSupported(&implicit_constraints, c.DRM_FORMAT_XRGB8888, common.drm_mod_invalid));
+    try std.testing.expect(!isPairSupported(&implicit_constraints, c.DRM_FORMAT_XRGB8888, common.drm_mod_linear));
 
     var mods: [max_modifiers]u64 = undefined;
-    const res = collectModifiersForFormat(&constraints, c.DRM_FORMAT_XRGB8888, &mods);
+    const res = collectModifiersForFormat(&explicit_constraints, c.DRM_FORMAT_XRGB8888, &mods);
     try std.testing.expect(res.found_format);
     try std.testing.expectEqual(@as(usize, 1), res.count);
 }

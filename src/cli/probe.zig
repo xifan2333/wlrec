@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c");
+const capture = @import("../capture/lib.zig");
 
 pub const ProbeResult = struct {
     wayland_ok: bool = false,
@@ -14,56 +15,19 @@ pub const ProbeResult = struct {
     driver_name_len: usize = 0,
 };
 
-const WaylandGlobals = struct {
-    copy_capture: bool = false,
-    source_mgr: bool = false,
-    dmabuf: bool = false,
-
-    fn handleGlobal(data: ?*anyopaque, reg: ?*c.wl_registry, name: u32, iface: [*c]const u8, ver: u32) callconv(.c) void {
-        _ = reg;
-        _ = name;
-        _ = ver;
-        const self: *@This() = @ptrCast(@alignCast(data));
-        const span = std.mem.span(iface);
-        if (std.mem.eql(u8, span, "ext_image_copy_capture_manager_v1")) self.copy_capture = true;
-        if (std.mem.eql(u8, span, "ext_output_image_capture_source_manager_v1")) self.source_mgr = true;
-        if (std.mem.eql(u8, span, "zwp_linux_dmabuf_v1")) self.dmabuf = true;
-    }
-
-    fn removeGlobal(data: ?*anyopaque, reg: ?*c.wl_registry, name: u32) callconv(.c) void {
-        _ = data;
-        _ = reg;
-        _ = name;
-    }
-};
-
 fn probeWayland(writer: anytype, result: *ProbeResult) !void {
     try writer.writeAll("[Wayland Display]\n");
-    const display = c.wl_display_connect(null);
-    if (display == null) {
+    const caps = capture.probeWaylandCapabilities(null);
+    if (!caps.wayland_ok) {
         try writer.writeAll("  Status: FAILED to connect to Wayland display\n");
         return;
     }
-    const dpy = display.?;
-    defer c.wl_display_disconnect(dpy);
     result.wayland_ok = true;
+    result.copy_capture_ok = caps.copy_capture_ok;
+    result.source_mgr_ok = caps.source_mgr_ok;
+    result.dmabuf_ok = caps.dmabuf_ok;
+
     try writer.writeAll("  Status: Connected to $WAYLAND_DISPLAY\n");
-
-    var globals = WaylandGlobals{};
-    const reg = c.wl_display_get_registry(dpy) orelse return;
-    defer c.wl_registry_destroy(reg);
-
-    const listener = c.wl_registry_listener{
-        .global = WaylandGlobals.handleGlobal,
-        .global_remove = WaylandGlobals.removeGlobal,
-    };
-    _ = c.wl_registry_add_listener(reg, &listener, &globals);
-    _ = c.wl_display_roundtrip(dpy);
-
-    result.copy_capture_ok = globals.copy_capture;
-    result.source_mgr_ok = globals.source_mgr;
-    result.dmabuf_ok = globals.dmabuf;
-
     try writer.print("  ext_image_copy_capture_manager_v1:        {s}\n", .{if (result.copy_capture_ok) "YES" else "MISSING"});
     try writer.print("  ext_output_image_capture_source_manager_v1: {s}\n", .{if (result.source_mgr_ok) "YES" else "MISSING"});
     try writer.print("  zwp_linux_dmabuf_v1:                       {s}\n", .{if (result.dmabuf_ok) "YES" else "MISSING"});

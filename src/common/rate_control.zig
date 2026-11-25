@@ -16,6 +16,8 @@ pub const RateControlProfile = struct {
         cbr,
     };
 
+    pub const max_bufsize_kb: u32 = @divTrunc(std.math.maxInt(i32), 8000);
+
     mode: Mode,
     bitrate_kbps: u32 = 0,
     maxrate_kbps: u32 = 0,
@@ -50,22 +52,20 @@ pub const RateControlProfile = struct {
         };
     }
 
+    fn validateBitrateFields(self: *const RateControlProfile) RateControlError!void {
+        if (self.bitrate_kbps == 0) return RateControlError.InvalidBitrate;
+        if (self.bufsize_kb == 0 or self.bufsize_kb > max_bufsize_kb) return RateControlError.InvalidBufSize;
+        if (self.mode == .cbr and self.maxrate_kbps != self.bitrate_kbps) return RateControlError.CbrRateMismatch;
+        if (self.mode == .vbr and self.maxrate_kbps < self.bitrate_kbps) return RateControlError.InvalidMaxRate;
+    }
+
     /// Validates the profile invariants according to driver/FFmpeg expectations.
     pub fn validate(self: *const RateControlProfile) RateControlError!void {
         switch (self.mode) {
             .cqp => {
                 if (self.qp > 51) return RateControlError.InvalidQp;
             },
-            .vbr => {
-                if (self.bitrate_kbps == 0) return RateControlError.InvalidBitrate;
-                if (self.maxrate_kbps < self.bitrate_kbps) return RateControlError.InvalidMaxRate;
-                if (self.bufsize_kb == 0) return RateControlError.InvalidBufSize;
-            },
-            .cbr => {
-                if (self.bitrate_kbps == 0) return RateControlError.InvalidBitrate;
-                if (self.maxrate_kbps != self.bitrate_kbps) return RateControlError.CbrRateMismatch;
-                if (self.bufsize_kb == 0) return RateControlError.InvalidBufSize;
-            },
+            .vbr, .cbr => try self.validateBitrateFields(),
         }
     }
 
@@ -96,6 +96,12 @@ test "RateControlProfile VBR validation" {
     // Maxrate lower than bitrate is invalid
     const invalid = RateControlProfile.vbr(4000, 2000, 6000);
     try std.testing.expectError(RateControlError.InvalidMaxRate, invalid.validate());
+
+    // Bufsize exceeding c_int bit-count limit is rejected instead of overflowing
+    const max_valid = RateControlProfile.vbr(2000, 3000, RateControlProfile.max_bufsize_kb);
+    try max_valid.validate();
+    const overflow_buf = RateControlProfile.vbr(2000, 3000, RateControlProfile.max_bufsize_kb + 1);
+    try std.testing.expectError(RateControlError.InvalidBufSize, overflow_buf.validate());
 }
 
 test "RateControlProfile CBR validation" {

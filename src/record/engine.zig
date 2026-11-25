@@ -7,6 +7,7 @@ const encode = @import("../encode/lib.zig");
 pub const RecordError = error{
     WaylandConnectFailed,
     VaapiInitFailed,
+    UnsupportedFormat,
     SurfaceAllocFailed,
     BufferImportFailed,
     FilterInitFailed,
@@ -62,7 +63,9 @@ fn createSurfaceSlots(device: *encode.VaapiDevice, session: *capture.CopyCapture
     }
 
     while (initialized < 2) : (initialized += 1) {
-        var surf = device.createAndExportSurface() catch return error.SurfaceAllocFailed;
+        var surf = device.createAndExportSurface(session.advertisedFormats()) catch |err| {
+            return if (err == encode.VaapiError.UnsupportedFormat) error.UnsupportedFormat else error.SurfaceAllocFailed;
+        };
         errdefer device.destroySurface(&surf);
         const buf = capture.DmabufBuffer.import(
             dmabuf,
@@ -105,18 +108,59 @@ fn isGracefulStop(err: anyerror) bool {
     return err == capture.CaptureError.Interrupted or err == capture.CaptureError.Timeout;
 }
 
+fn mapVaapiError(err: encode.VaapiError) RecordError {
+    return if (err == encode.VaapiError.UnsupportedFormat) error.UnsupportedFormat else error.VaapiInitFailed;
+}
+
+fn rebindDeviceAndSlots(
+    session: *capture.CopyCaptureSession,
+    device: *encode.VaapiDevice,
+    slots: *[2]SurfaceSlot,
+    stop_fd: ?std.posix.fd_t,
+    deadline_ms: ?u64,
+) !void {
+    session.waitConstraints(stop_fd, deadline_ms) catch |err| {
+        if (isGracefulStop(err)) return err;
+        return error.CaptureFailed;
+    };
+
+    device.reconfigure(session.width, session.height, session.advertisedFormats()) catch |err| {
+        return mapVaapiError(err);
+    };
+
+    var new_slots: [2]SurfaceSlot = undefined;
+    try createSurfaceSlots(device, session, &new_slots);
+
+    destroySurfaceSlots(device, slots);
+    slots.* = new_slots;
+}
+
+fn captureFirstFrameWithRetry(
+    session: *capture.CopyCaptureSession,
+    device: *encode.VaapiDevice,
+    slots: *[2]SurfaceSlot,
+    deadline_ms: ?u64,
+    config: RecordConfig,
+) !u64 {
+    while (true) {
+        return session.captureFrame(&slots[0].buffer, config.stop_fd, deadline_ms) catch |err| {
+            if (isGracefulStop(err)) return err;
+            if (err != capture.CaptureError.BufferConstraints) return error.CaptureFailed;
+            try rebindDeviceAndSlots(session, device, slots, config.stop_fd, deadline_ms);
+            continue;
+        };
+    }
+}
+
 fn initFirstFrame(
     session: *capture.CopyCaptureSession,
     device: *encode.VaapiDevice,
-    slot: *const SurfaceSlot,
+    slots: *[2]SurfaceSlot,
     deadline_ms: ?u64,
     clock: *common.VfrClock,
     config: RecordConfig,
 ) !struct { filter: encode.VaapiFilterGraph, encoder: encode.VaapiEncoder, first_out: *c.AVFrame } {
-    const pts_ns = session.captureFrame(&slot.buffer, config.stop_fd, deadline_ms) catch |err| {
-        if (isGracefulStop(err)) return err;
-        return error.CaptureFailed;
-    };
+    const pts_ns = try captureFirstFrameWithRetry(session, device, slots, deadline_ms, config);
     _ = clock.registerFrame(pts_ns);
 
     const enc_dims = encode.filter_graph.transformedDimensions(session.width, session.height, session.frame_transform);
@@ -128,7 +172,7 @@ fn initFirstFrame(
     ) catch return error.FilterInitFailed;
     errdefer filter.deinit();
 
-    const first_out = filter.filterSurface(slot.surface.surface_id, 0) catch return error.FilterInitFailed;
+    const first_out = filter.filterSurface(slots[0].surface.surface_id, 0) catch return error.FilterInitFailed;
     errdefer {
         var f: ?*c.AVFrame = first_out;
         c.av_frame_free(&f);
@@ -161,36 +205,16 @@ const RecordingContext = struct {
 };
 
 fn rebindCapturePipeline(ctx: *RecordingContext) !void {
-    ctx.session.waitConstraints(ctx.config.stop_fd, ctx.deadline_ms) catch |err| {
-        if (isGracefulStop(err)) return err;
-        return error.CaptureFailed;
-    };
-
-    var new_device = encode.VaapiDevice.init(
-        ctx.config.device_path,
-        ctx.session.width,
-        ctx.session.height,
-        ctx.session.advertisedFormats(),
-    ) catch return error.VaapiInitFailed;
-    errdefer new_device.deinit();
-
-    var new_slots: [2]SurfaceSlot = undefined;
-    try createSurfaceSlots(&new_device, ctx.session, &new_slots);
-    errdefer destroySurfaceSlots(&new_device, &new_slots);
+    try rebindDeviceAndSlots(ctx.session, ctx.device, ctx.slots, ctx.config.stop_fd, ctx.deadline_ms);
 
     const new_filter = encode.VaapiFilterGraph.init(
-        &new_device,
+        ctx.device,
         ctx.encoder.width,
         ctx.encoder.height,
         ctx.session.frame_transform,
     ) catch return error.FilterInitFailed;
 
     ctx.filter.deinit();
-    destroySurfaceSlots(ctx.device, ctx.slots);
-    ctx.device.deinit();
-
-    ctx.device.* = new_device;
-    ctx.slots.* = new_slots;
     ctx.filter.* = new_filter;
 }
 
@@ -284,7 +308,7 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
         session.width,
         session.height,
         session.advertisedFormats(),
-    ) catch return error.VaapiInitFailed;
+    ) catch |err| return mapVaapiError(err);
     defer device.deinit();
 
     var slots: [2]SurfaceSlot = undefined;
@@ -295,7 +319,7 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
     const start_ms = capture.CopyCaptureSession.monotonicMs();
     const deadline_ms: ?u64 = if (config.duration_secs > 0) start_ms + config.duration_secs * 1000 else null;
 
-    const init_res = initFirstFrame(&session, &device, &slots[0], deadline_ms, &clock, config) catch |err| {
+    const init_res = initFirstFrame(&session, &device, &slots, deadline_ms, &clock, config) catch |err| {
         if (isGracefulStop(err)) return stats;
         return err;
     };
@@ -305,9 +329,11 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
     defer encoder.deinit();
     stats.frames_captured += 1;
 
-    encoder.sendFrame(init_res.first_out) catch return error.EncodeFailed;
-    var first_f: ?*c.AVFrame = init_res.first_out;
-    c.av_frame_free(&first_f);
+    {
+        var first_f: ?*c.AVFrame = init_res.first_out;
+        defer c.av_frame_free(&first_f);
+        encoder.sendFrame(init_res.first_out) catch return error.EncodeFailed;
+    }
     try drainEncoderPackets(&encoder, out_fd, &stats);
 
     var ctx = RecordingContext{
@@ -343,4 +369,10 @@ test "RecordStats default values and rate control selection" {
     const vbr_rc = selectRateControl(.{ .output_path = "a.h264", .bitrate = 6_000_000 });
     try std.testing.expectEqual(common.RateControlProfile.Mode.vbr, vbr_rc.mode);
     try std.testing.expectEqual(@as(u32, 6000), vbr_rc.bitrate_kbps);
+
+    try std.testing.expectEqual(RecordError.UnsupportedFormat, mapVaapiError(encode.VaapiError.UnsupportedFormat));
+    try std.testing.expectEqual(RecordError.VaapiInitFailed, mapVaapiError(encode.VaapiError.DeviceCreateFailed));
+    try std.testing.expect(isGracefulStop(capture.CaptureError.Timeout));
+    try std.testing.expect(isGracefulStop(capture.CaptureError.Interrupted));
+    try std.testing.expect(!isGracefulStop(capture.CaptureError.BufferConstraints));
 }
