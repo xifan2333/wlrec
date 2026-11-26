@@ -3,6 +3,7 @@ pub const c = @import("c");
 pub const common = @import("common/lib.zig");
 pub const capture = @import("capture/lib.zig");
 pub const encode = @import("encode/lib.zig");
+pub const audio = @import("audio/lib.zig");
 pub const mux = @import("mux/lib.zig");
 pub const record = @import("record/lib.zig");
 pub const cli = @import("cli/lib.zig");
