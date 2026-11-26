@@ -189,10 +189,6 @@ pub const MuxSink = struct {
         self.header_written = true;
     }
 
-    pub fn openVideoStream(self: *MuxSink, codec_ctx: *const c.AVCodecContext) MuxError!void {
-        return self.openStreams(codec_ctx, null);
-    }
-
     fn writeFilePacket(
         self: *MuxSink,
         stream: *c.AVStream,
@@ -242,10 +238,6 @@ pub const MuxSink = struct {
         }
         const stream = self.audio_stream orelse return MuxError.PacketWriteFailed;
         return self.writeFilePacket(stream, self.audio_src_time_base, raw_pkt);
-    }
-
-    pub fn writePacket(self: *MuxSink, raw_pkt: *const c.AVPacket) MuxError!void {
-        return self.writeVideoPacket(raw_pkt);
     }
 
     /// Flush buffered packets, write the container trailer, and close the output handle.
@@ -487,7 +479,7 @@ test "MuxSink writes valid MP4, MKV, FLV, and H264 files with synthetic packets"
         var ctx_opt: ?*c.AVCodecContext = ctx;
         defer c.avcodec_free_context(&ctx_opt);
 
-        try sink.openVideoStream(ctx);
+        try sink.openStreams(ctx, null);
         try sendTestVideoBatch(&sink);
 
         try sink.finish();
