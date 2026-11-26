@@ -18,6 +18,24 @@ pub const AudioEncoderError = error{
     ReceivePacketFailed,
 };
 
+/// OwningHandle wrapping a reference-counted encoded AAC packet.
+pub const EncodedAudioPacket = struct {
+    pts: i64,
+    dts: i64,
+    duration: i64,
+    size: usize,
+    raw_packet: *c.AVPacket,
+
+    pub fn dataSlice(self: *const EncodedAudioPacket) []const u8 {
+        return self.raw_packet.*.data[0..self.size];
+    }
+
+    pub fn deinit(self: *EncodedAudioPacket) void {
+        var p: ?*c.AVPacket = self.raw_packet;
+        c.av_packet_free(&p);
+    }
+};
+
 fn configureCodecContext(
     ctx: *c.AVCodecContext,
     bitrate_bps: u32,
@@ -52,7 +70,7 @@ fn allocPlanarFrame(ctx: *const c.AVCodecContext) AudioEncoderError!*c.AVFrame {
     return frame;
 }
 
-/// Owning FFmpeg native AAC encoder with pre-allocated planar frame and packet buffers.
+/// Owning FFmpeg native AAC encoder with pre-allocated planar frame and poll scratch packet.
 pub const AudioEncoder = struct {
     codec_ctx: *c.AVCodecContext,
     frame: *c.AVFrame,
@@ -132,13 +150,23 @@ pub const AudioEncoder = struct {
         }
     }
 
-    /// Poll the next encoded AAC packet into the reusable scratch packet.
-    pub fn pollPacket(self: *AudioEncoder) AudioEncoderError!?*const c.AVPacket {
+    /// Poll the next encoded AAC packet as a standalone OwningHandle.
+    pub fn receivePacket(self: *AudioEncoder) AudioEncoderError!?EncodedAudioPacket {
         c.av_packet_unref(self.scratch_pkt);
         const rc = c.avcodec_receive_packet(self.codec_ctx, self.scratch_pkt);
         if (rc == averror_eagain or rc == c.AVERROR_EOF) return null;
         if (rc < 0) return AudioEncoderError.ReceivePacketFailed;
-        return self.scratch_pkt;
+
+        const cloned = c.av_packet_clone(self.scratch_pkt) orelse {
+            return AudioEncoderError.ReceivePacketFailed;
+        };
+        return .{
+            .pts = cloned.*.pts,
+            .dts = cloned.*.dts,
+            .duration = cloned.*.duration,
+            .size = @intCast(@max(@as(c_int, 0), cloned.*.size)),
+            .raw_packet = cloned,
+        };
     }
 };
 
@@ -168,16 +196,20 @@ test "AudioEncoder encodes stereo f32 blocks to AAC with global header and flush
     for (0..6) |blk_idx| {
         const pts: i64 = @intCast(blk_idx * pcm.frame_samples);
         try enc.submitStereoBlock(&block, pts);
-        while (try enc.pollPacket()) |pkt| {
+        while (try enc.receivePacket()) |pkt_val| {
+            var pkt = pkt_val;
+            defer pkt.deinit();
             total_packets += 1;
-            total_bytes += @intCast(@max(@as(c_int, 0), pkt.*.size));
+            total_bytes += pkt.dataSlice().len;
         }
     }
 
     try enc.flush();
-    while (try enc.pollPacket()) |pkt| {
+    while (try enc.receivePacket()) |pkt_val| {
+        var pkt = pkt_val;
+        defer pkt.deinit();
         total_packets += 1;
-        total_bytes += @intCast(@max(@as(c_int, 0), pkt.*.size));
+        total_bytes += pkt.dataSlice().len;
     }
 
     try std.testing.expect(total_packets >= 6);

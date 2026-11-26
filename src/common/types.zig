@@ -61,10 +61,16 @@ pub const AudioSourceMode = union(enum) {
 
     pub fn parse(spec: []const u8) AudioSourceParseError!AudioSourceMode {
         if (spec.len == 0) return AudioSourceParseError.InvalidAudioSource;
-        if (std.ascii.eqlIgnoreCase(spec, "none")) return .none;
-        if (std.ascii.eqlIgnoreCase(spec, "desktop")) return .desktop;
-        if (std.ascii.eqlIgnoreCase(spec, "mic")) return .mic;
-        if (std.ascii.eqlIgnoreCase(spec, "both")) return .both;
+        const NamedMode = struct { name: []const u8, mode: AudioSourceMode };
+        const builtins = [_]NamedMode{
+            .{ .name = "none", .mode = .none },
+            .{ .name = "desktop", .mode = .desktop },
+            .{ .name = "mic", .mode = .mic },
+            .{ .name = "both", .mode = .both },
+        };
+        for (builtins) |entry| {
+            if (std.ascii.eqlIgnoreCase(spec, entry.name)) return entry.mode;
+        }
         if (std.mem.indexOfScalar(u8, spec, 0) != null) {
             return AudioSourceParseError.InvalidAudioSource;
         }

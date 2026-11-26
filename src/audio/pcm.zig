@@ -135,11 +135,8 @@ pub const SourceCursor = struct {
         pad_tail_silence: bool,
     ) bool {
         const avail = self.readyFrames(ring);
+        if (avail == 0) return false;
         if (!pad_tail_silence and avail < frame_samples) return false;
-        if (pad_tail_silence and avail == 0 and self.skip_remaining > 0) {
-            @memset(dest, 0.0);
-            return true;
-        }
 
         const pad_frames: usize = @intCast(@min(self.pad_remaining, frame_samples));
         if (pad_frames > 0) {
@@ -158,7 +155,7 @@ pub const SourceCursor = struct {
         if (filled < frame_samples) {
             @memset(dest[filled * channels .. block_floats], 0.0);
         }
-        return filled > 0 or pad_tail_silence;
+        return filled > 0;
     }
 
     pub fn consumeDrops(self: *SourceCursor, cumulative_drops: u64) u64 {

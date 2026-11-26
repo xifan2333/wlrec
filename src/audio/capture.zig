@@ -6,6 +6,7 @@ const pcm = @import("pcm.zig");
 pub const AudioCaptureError = error{
     OutOfMemory,
     InvalidSource,
+    WakeFdCreateFailed,
     MainloopInitFailed,
     ContextConnectFailed,
     StreamConnectFailed,
@@ -14,18 +15,45 @@ pub const AudioCaptureError = error{
 pub const default_monitor_source: [:0]const u8 = "@DEFAULT_MONITOR@";
 pub const default_mic_source: [:0]const u8 = "@DEFAULT_SOURCE@";
 
+/// OwningHandle around a non-blocking Linux eventfd descriptor.
+pub const EventFd = struct {
+    fd: std.posix.fd_t = -1,
+
+    pub fn init() AudioCaptureError!EventFd {
+        const raw_fd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
+        if (raw_fd < 0) return AudioCaptureError.WakeFdCreateFailed;
+        return .{ .fd = raw_fd };
+    }
+
+    pub fn deinit(self: *EventFd) void {
+        if (self.fd >= 0) {
+            _ = c.close(self.fd);
+            self.fd = -1;
+        }
+    }
+
+    pub fn signal(self: EventFd) void {
+        if (self.fd < 0) return;
+        const val: u64 = 1;
+        _ = c.write(self.fd, &val, @sizeOf(u64));
+    }
+
+    pub fn wait(self: EventFd, timeout_ms: c_int) void {
+        if (self.fd < 0) return;
+        var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, timeout_ms) > 0) {
+            var val: u64 = 0;
+            _ = c.read(self.fd, &val, @sizeOf(u64));
+        }
+    }
+};
+
 pub fn monotonicNs() u64 {
     var ts: c.struct_timespec = undefined;
     if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 1;
     const sec: u64 = @intCast(@max(@as(i64, 0), ts.tv_sec));
     const nsec: u64 = @intCast(@max(@as(i64, 0), ts.tv_nsec));
     return @max(@as(u64, 1), sec * std.time.ns_per_s + nsec);
-}
-
-fn signalEventFd(fd: std.posix.fd_t) void {
-    if (fd < 0) return;
-    const val: u64 = 1;
-    _ = c.write(fd, &val, @sizeOf(u64));
 }
 
 fn copyCStringBounded(dest: []u8, raw: [*c]const u8) usize {
@@ -73,7 +101,7 @@ fn streamStateTrampoline(stream: ?*c.pa_stream, userdata: ?*anyopaque) callconv(
     const self: *AudioCapture = @ptrCast(@alignCast(userdata orelse return));
     const state = c.pa_stream_get_state(stream);
     if (state == c.PA_STREAM_READY or state == c.PA_STREAM_FAILED or state == c.PA_STREAM_TERMINATED) {
-        mainloopSignalCb(self.mainloop);
+        if (self.conn) |conn| mainloopSignalCb(conn.mainloop);
     }
 }
 
@@ -101,6 +129,55 @@ fn waitForStreamReady(ml: *c.pa_threaded_mainloop, stream: *c.pa_stream) bool {
     }
 }
 
+/// Shared OwningHandle managing a connected PulseAudio threaded mainloop and context.
+const PulseConnection = struct {
+    mainloop: *c.pa_threaded_mainloop,
+    context: *c.pa_context,
+    running: bool = false,
+
+    fn connect(client_name: [*:0]const u8, no_autospawn: bool) AudioCaptureError!PulseConnection {
+        const ml = c.pa_threaded_mainloop_new() orelse return AudioCaptureError.MainloopInitFailed;
+        errdefer c.pa_threaded_mainloop_free(ml);
+
+        const api = c.pa_threaded_mainloop_get_api(ml);
+        const ctx = c.pa_context_new(api, client_name) orelse return AudioCaptureError.ContextConnectFailed;
+        c.pa_context_set_state_callback(ctx, contextStateTrampoline, ml);
+
+        var conn = PulseConnection{ .mainloop = ml, .context = ctx };
+        errdefer conn.teardownInner();
+
+        c.pa_threaded_mainloop_lock(ml);
+        defer c.pa_threaded_mainloop_unlock(ml);
+
+        if (c.pa_threaded_mainloop_start(ml) < 0) return AudioCaptureError.MainloopInitFailed;
+        conn.running = true;
+
+        const raw_flag = if (no_autospawn) c.PA_CONTEXT_NOAUTOSPAWN else c.PA_CONTEXT_NOFLAGS;
+        const ctx_flags: c.pa_context_flags_t = @intCast(raw_flag);
+        if (c.pa_context_connect(ctx, null, ctx_flags, null) < 0) return AudioCaptureError.ContextConnectFailed;
+        if (!waitForContextReady(ml, ctx)) return AudioCaptureError.ContextConnectFailed;
+
+        return conn;
+    }
+
+    fn teardownInner(self: *PulseConnection) void {
+        c.pa_threaded_mainloop_lock(self.mainloop);
+        c.pa_context_set_state_callback(self.context, null, null);
+        c.pa_context_disconnect(self.context);
+        c.pa_context_unref(self.context);
+        c.pa_threaded_mainloop_unlock(self.mainloop);
+        if (self.running) {
+            c.pa_threaded_mainloop_stop(self.mainloop);
+            self.running = false;
+        }
+    }
+
+    fn deinit(self: *PulseConnection) void {
+        self.teardownInner();
+        c.pa_threaded_mainloop_free(self.mainloop);
+    }
+};
+
 fn computeStreamStartNs(stream: *c.pa_stream) u64 {
     const now_ns = monotonicNs();
     var lat_usec: c.pa_usec_t = 0;
@@ -116,9 +193,8 @@ fn computeStreamStartNs(stream: *c.pa_stream) u64 {
 pub const AudioCapture = struct {
     allocator: std.mem.Allocator,
     owned_device_z: ?[:0]u8 = null,
-    wake_fd: std.posix.fd_t = -1,
-    mainloop: ?*c.pa_threaded_mainloop = null,
-    context: ?*c.pa_context = null,
+    wake: EventFd = .{},
+    conn: ?PulseConnection = null,
     stream: ?*c.pa_stream = null,
 
     ring: pcm.AudioRingBuffer = .init(),
@@ -129,7 +205,7 @@ pub const AudioCapture = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         mode: common.AudioSourceMode,
-        wake_fd: std.posix.fd_t,
+        wake: EventFd,
     ) AudioCaptureError!*AudioCapture {
         const target = try resolveSourceTarget(allocator, mode);
         errdefer if (target.owned) |owned| allocator.free(owned);
@@ -138,40 +214,30 @@ pub const AudioCapture = struct {
         self.* = .{
             .allocator = allocator,
             .owned_device_z = target.owned,
-            .wake_fd = wake_fd,
+            .wake = wake,
         };
         errdefer {
             self.owned_device_z = null;
             self.deinit();
         }
 
-        try self.connectPulseStream(target.ptr);
+        try self.openStream(target.ptr);
         return self;
     }
 
-    fn connectPulseStream(self: *AudioCapture, device_ptr: [*:0]const u8) AudioCaptureError!void {
-        const ml = c.pa_threaded_mainloop_new() orelse return AudioCaptureError.MainloopInitFailed;
-        self.mainloop = ml;
+    fn openStream(self: *AudioCapture, device_ptr: [*:0]const u8) AudioCaptureError!void {
+        self.conn = try PulseConnection.connect("wlrec", false);
+        const conn = &self.conn.?;
 
-        const api = c.pa_threaded_mainloop_get_api(ml);
-        const ctx = c.pa_context_new(api, "wlrec") orelse return AudioCaptureError.ContextConnectFailed;
-        self.context = ctx;
-        c.pa_context_set_state_callback(ctx, contextStateTrampoline, ml);
-
-        c.pa_threaded_mainloop_lock(ml);
-        defer c.pa_threaded_mainloop_unlock(ml);
-
-        if (c.pa_threaded_mainloop_start(ml) < 0) return AudioCaptureError.MainloopInitFailed;
-        const ctx_flags: c.pa_context_flags_t = @intCast(c.PA_CONTEXT_NOFLAGS);
-        if (c.pa_context_connect(ctx, null, ctx_flags, null) < 0) return AudioCaptureError.ContextConnectFailed;
-        if (!waitForContextReady(ml, ctx)) return AudioCaptureError.ContextConnectFailed;
+        c.pa_threaded_mainloop_lock(conn.mainloop);
+        defer c.pa_threaded_mainloop_unlock(conn.mainloop);
 
         const spec = c.pa_sample_spec{
             .format = c.PA_SAMPLE_FLOAT32LE,
             .rate = pcm.sample_rate,
             .channels = @intCast(pcm.channels),
         };
-        const stream = c.pa_stream_new(ctx, "wlrec-audio", &spec, null) orelse {
+        const stream = c.pa_stream_new(conn.context, "wlrec-audio", &spec, null) orelse {
             return AudioCaptureError.StreamConnectFailed;
         };
         self.stream = stream;
@@ -189,7 +255,7 @@ pub const AudioCapture = struct {
         if (c.pa_stream_connect_record(stream, device_ptr, &attr, flags) < 0) {
             return AudioCaptureError.StreamConnectFailed;
         }
-        if (!waitForStreamReady(ml, stream)) return AudioCaptureError.StreamConnectFailed;
+        if (!waitForStreamReady(conn.mainloop, stream)) return AudioCaptureError.StreamConnectFailed;
     }
 
     /// Zero-allocation, lock-free ingestion of one PulseAudio read fragment.
@@ -213,10 +279,24 @@ pub const AudioCapture = struct {
 
         if (pushed > 0) {
             _ = self.captured_frames.fetchAdd(pushed, .monotonic);
-            signalEventFd(self.wake_fd);
+            self.wake.signal();
         }
         if (pushed < stereo_frames) {
             _ = self.dropped_frames.fetchAdd(stereo_frames - pushed, .release);
+        }
+    }
+
+    /// Consumer-side cap on queued pre-t0 audio before the first Wayland video frame arrives.
+    pub fn trimPrestartBacklog(self: *AudioCapture, max_frames: usize) void {
+        const readable = pcm.readableFrames(&self.ring);
+        if (readable <= max_frames) return;
+        const discarded = pcm.discardStereoFrames(&self.ring, readable - max_frames);
+        if (discarded == 0) return;
+
+        const advance_ns = (@as(u128, discarded) * std.time.ns_per_s) / pcm.sample_rate;
+        const prev_ns = self.firstSampleNs();
+        if (prev_ns > 0) {
+            self.first_sample_ns.store(prev_ns + @as(u64, @intCast(advance_ns)), .release);
         }
     }
 
@@ -248,25 +328,18 @@ pub const AudioCapture = struct {
     }
 
     pub fn deinit(self: *AudioCapture) void {
-        if (self.mainloop) |ml| {
-            c.pa_threaded_mainloop_lock(ml);
+        if (self.conn) |*conn| {
             if (self.stream) |s| {
+                c.pa_threaded_mainloop_lock(conn.mainloop);
                 c.pa_stream_set_read_callback(s, null, null);
                 c.pa_stream_set_state_callback(s, null, null);
                 _ = c.pa_stream_disconnect(s);
                 c.pa_stream_unref(s);
                 self.stream = null;
+                c.pa_threaded_mainloop_unlock(conn.mainloop);
             }
-            if (self.context) |ctx| {
-                c.pa_context_set_state_callback(ctx, null, null);
-                c.pa_context_disconnect(ctx);
-                c.pa_context_unref(ctx);
-                self.context = null;
-            }
-            c.pa_threaded_mainloop_unlock(ml);
-            c.pa_threaded_mainloop_stop(ml);
-            c.pa_threaded_mainloop_free(ml);
-            self.mainloop = null;
+            conn.deinit();
+            self.conn = null;
         }
         if (self.owned_device_z) |owned| {
             self.allocator.free(owned);
@@ -323,36 +396,18 @@ fn serverInfoTrampoline(
 
 /// Non-spawning probe of the local PulseAudio / PipeWire-Pulse server and default endpoints.
 pub fn probePulseAudio() AudioProbeReport {
-    const ml = c.pa_threaded_mainloop_new() orelse return .{};
-    defer c.pa_threaded_mainloop_free(ml);
+    var conn = PulseConnection.connect("wlrec-probe", true) catch return .{};
+    defer conn.deinit();
 
-    const api = c.pa_threaded_mainloop_get_api(ml);
-    const ctx = c.pa_context_new(api, "wlrec-probe") orelse return .{};
-    c.pa_context_set_state_callback(ctx, contextStateTrampoline, ml);
+    c.pa_threaded_mainloop_lock(conn.mainloop);
+    defer c.pa_threaded_mainloop_unlock(conn.mainloop);
 
-    c.pa_threaded_mainloop_lock(ml);
-    var running = false;
-    defer {
-        c.pa_context_set_state_callback(ctx, null, null);
-        c.pa_context_disconnect(ctx);
-        c.pa_context_unref(ctx);
-        c.pa_threaded_mainloop_unlock(ml);
-        if (running) c.pa_threaded_mainloop_stop(ml);
-    }
-
-    if (c.pa_threaded_mainloop_start(ml) < 0) return .{};
-    running = true;
-
-    const flags: c.pa_context_flags_t = @intCast(c.PA_CONTEXT_NOAUTOSPAWN);
-    if (c.pa_context_connect(ctx, null, flags, null) < 0) return .{};
-    if (!waitForContextReady(ml, ctx)) return .{};
-
-    var probe_state = ServerInfoProbeState{ .ml = ml };
-    const op = c.pa_context_get_server_info(ctx, serverInfoTrampoline, &probe_state) orelse return .{};
+    var probe_state = ServerInfoProbeState{ .ml = conn.mainloop };
+    const op = c.pa_context_get_server_info(conn.context, serverInfoTrampoline, &probe_state) orelse return .{};
     defer c.pa_operation_unref(op);
 
     while (!probe_state.done and c.pa_operation_get_state(op) == c.PA_OPERATION_RUNNING) {
-        c.pa_threaded_mainloop_wait(ml);
+        c.pa_threaded_mainloop_wait(conn.mainloop);
     }
     return probe_state.report;
 }
@@ -373,35 +428,31 @@ test "resolveSourceTarget maps built-in modes and rejects unsupported composites
     try std.testing.expectError(AudioCaptureError.InvalidSource, resolveSourceTarget(std.testing.allocator, .both));
 }
 
-test "AudioCapture ingestRawChunk records first timestamp, handles holes, and signals wake_fd" {
-    const efd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
-    try std.testing.expect(efd >= 0);
-    defer _ = c.close(efd);
+test "AudioCapture ingestRawChunk, trimPrestartBacklog, and EventFd wakeup" {
+    var wake = try EventFd.init();
+    defer wake.deinit();
 
     const cap = try std.testing.allocator.create(AudioCapture);
     cap.* = .{
         .allocator = std.testing.allocator,
-        .wake_fd = efd,
+        .wake = wake,
     };
     defer cap.deinit();
 
     const samples = [_]f32{ 0.25, -0.25, 0.5, -0.5 };
-    cap.ingestRawChunk(&samples, @sizeOf(@TypeOf(samples)), 123_456_789);
+    cap.ingestRawChunk(&samples, @sizeOf(@TypeOf(samples)), 1_000_000_000);
 
-    try std.testing.expectEqual(@as(u64, 123_456_789), cap.firstSampleNs());
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), cap.firstSampleNs());
     try std.testing.expectEqual(@as(u64, 2), cap.capturedFrames());
-    try std.testing.expectEqual(@as(u64, 0), cap.droppedFrames());
+    wake.wait(0);
 
-    var wake_val: u64 = 0;
-    try std.testing.expectEqual(@as(isize, @sizeOf(u64)), c.read(efd, &wake_val, @sizeOf(u64)));
-    try std.testing.expectEqual(@as(u64, 1), wake_val);
+    // Stream hole (null data_ptr) + backlog trim advances first_sample_ns proportionally
+    cap.ingestRawChunk(null, 48 * pcm.channels * @sizeOf(f32), 9_999_999_999);
+    try std.testing.expectEqual(@as(u64, 50), cap.capturedFrames());
+    cap.trimPrestartBacklog(2);
+    try std.testing.expectEqual(@as(usize, 2), pcm.readableFrames(&cap.ring));
+    try std.testing.expectEqual(@as(u64, 1_001_000_000), cap.firstSampleNs());
 
-    // Subsequent chunk must not overwrite firstSampleNs; null data_ptr represents stream hole
-    cap.ingestRawChunk(null, 4 * pcm.channels * @sizeOf(f32), 999_999_999);
-    try std.testing.expectEqual(@as(u64, 123_456_789), cap.firstSampleNs());
-    try std.testing.expectEqual(@as(u64, 6), cap.capturedFrames());
-
-    // Overflow accounting
     const cap_pairs = pcm.ring_capacity_floats / pcm.channels;
     _ = pcm.pushSilenceFrames(&cap.ring, cap_pairs);
     cap.ingestRawChunk(&samples, @sizeOf(@TypeOf(samples)), 0);
