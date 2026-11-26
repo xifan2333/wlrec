@@ -1,4 +1,6 @@
 const std = @import("std");
+const common = @import("../common/lib.zig");
+const audio = @import("../audio/lib.zig");
 
 pub const Subcommand = enum {
     probe,
@@ -13,6 +15,8 @@ pub const RecordOptions = struct {
     fps: u32 = 60,
     qp: u8 = 23,
     bitrate: ?u32 = null,
+    audio_mode: common.AudioSourceMode = .none,
+    audio_bitrate: u32 = audio.default_bitrate_bps,
     duration_secs: u64 = 0,
 };
 
@@ -26,47 +30,69 @@ pub const CliError = error{
     UnknownOption,
     MissingOptionValue,
     InvalidNumber,
+    InvalidAudioSource,
 };
 
-fn parseEncoderOption(flag: []const u8, val: []const u8, opts: *RecordOptions) !bool {
-    if (std.mem.eql(u8, flag, "-q") or std.mem.eql(u8, flag, "--qp")) {
-        opts.qp = std.fmt.parseInt(u8, val, 10) catch return error.InvalidNumber;
-        opts.bitrate = null;
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "-b") or std.mem.eql(u8, flag, "--bitrate")) {
-        const br = std.fmt.parseInt(u32, val, 10) catch return error.InvalidNumber;
-        if (br == 0) return error.InvalidNumber;
-        opts.bitrate = br;
-        return true;
-    }
-    return false;
+const FlagHandler = *const fn (*RecordOptions, []const u8) CliError!void;
+
+fn setOutput(opts: *RecordOptions, val: []const u8) CliError!void {
+    opts.output_path = val;
 }
 
-fn parseTimeOption(flag: []const u8, val: []const u8, opts: *RecordOptions) !bool {
-    if (std.mem.eql(u8, flag, "-f") or std.mem.eql(u8, flag, "--fps")) {
-        opts.fps = std.fmt.parseInt(u32, val, 10) catch return error.InvalidNumber;
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "--duration")) {
-        opts.duration_secs = std.fmt.parseInt(u64, val, 10) catch return error.InvalidNumber;
-        return true;
-    }
-    return false;
+fn setDevice(opts: *RecordOptions, val: []const u8) CliError!void {
+    opts.device_path = val;
 }
+
+fn setQp(opts: *RecordOptions, val: []const u8) CliError!void {
+    opts.qp = std.fmt.parseInt(u8, val, 10) catch return error.InvalidNumber;
+    opts.bitrate = null;
+}
+
+fn setBitrate(opts: *RecordOptions, val: []const u8) CliError!void {
+    const br = std.fmt.parseInt(u32, val, 10) catch return error.InvalidNumber;
+    if (br == 0) return error.InvalidNumber;
+    opts.bitrate = br;
+}
+
+fn setFps(opts: *RecordOptions, val: []const u8) CliError!void {
+    opts.fps = std.fmt.parseInt(u32, val, 10) catch return error.InvalidNumber;
+}
+
+fn setDuration(opts: *RecordOptions, val: []const u8) CliError!void {
+    opts.duration_secs = std.fmt.parseInt(u64, val, 10) catch return error.InvalidNumber;
+}
+
+fn setAudio(opts: *RecordOptions, val: []const u8) CliError!void {
+    opts.audio_mode = common.AudioSourceMode.parse(val) catch return error.InvalidAudioSource;
+}
+
+fn setAudioBitrate(opts: *RecordOptions, val: []const u8) CliError!void {
+    const abr = std.fmt.parseInt(u32, val, 10) catch return error.InvalidNumber;
+    if (abr < audio.encoder.min_bitrate_bps or abr > audio.encoder.max_bitrate_bps) {
+        return error.InvalidNumber;
+    }
+    opts.audio_bitrate = abr;
+}
+
+const flag_map = std.StaticStringMap(FlagHandler).initComptime(.{
+    .{ "-o", setOutput },
+    .{ "--output", setOutput },
+    .{ "-d", setDevice },
+    .{ "--device", setDevice },
+    .{ "-q", setQp },
+    .{ "--qp", setQp },
+    .{ "-b", setBitrate },
+    .{ "--bitrate", setBitrate },
+    .{ "-f", setFps },
+    .{ "--fps", setFps },
+    .{ "--duration", setDuration },
+    .{ "--audio", setAudio },
+    .{ "--audio-bitrate", setAudioBitrate },
+});
 
 fn parseRecordFlag(opts: *RecordOptions, flag: []const u8, val: []const u8) !void {
-    if (std.mem.eql(u8, flag, "-o") or std.mem.eql(u8, flag, "--output")) {
-        opts.output_path = val;
-        return;
-    }
-    if (std.mem.eql(u8, flag, "-d") or std.mem.eql(u8, flag, "--device")) {
-        opts.device_path = val;
-        return;
-    }
-    if (try parseEncoderOption(flag, val, opts)) return;
-    if (try parseTimeOption(flag, val, opts)) return;
-    return error.UnknownOption;
+    const handler = flag_map.get(flag) orelse return error.UnknownOption;
+    try handler(opts, val);
 }
 
 fn parseRecordArgs(opts: *RecordOptions, args: []const []const u8) !void {
@@ -123,9 +149,11 @@ pub fn printUsage(writer: anytype) !void {
         \\  -o, --output <path>    Output file (.mp4/.mkv/.flv/.h264) or rtmp:// URL (default: output.h264)
         \\  -d, --device <path>    DRM render node path (default: /dev/dri/renderD128)
         \\  -f, --fps <num>        Capture framerate (default: 60)
-        \\  -q, --qp <num>         H.264 CQP quantization parameter (default: 23)
-        \\  -b, --bitrate <num>    Target VBR bitrate in bps (overrides --qp)
-        \\  --duration <seconds>   Recording duration limit in seconds (0 = unlimited)
+        \\  -q, --qp <num>          H.264 CQP quantization parameter (default: 23)
+        \\  -b, --bitrate <num>     Target VBR bitrate in bps (overrides --qp)
+        \\  --audio <source>        Audio capture: none|desktop|mic|both|<source> (default: none)
+        \\  --audio-bitrate <bps>   Audio AAC bitrate in bps, 32000-512000 (default: 128000)
+        \\  --duration <seconds>    Recording duration limit in seconds (0 = unlimited)
         \\
     );
 }
@@ -198,4 +226,26 @@ test "parseFromSlice error handling" {
 
     const zero_bitrate = [_][]const u8{ "wlrec", "record", "-b", "0" };
     try std.testing.expectError(error.InvalidNumber, parseFromSlice(&zero_bitrate));
+
+    const bad_audio = [_][]const u8{ "wlrec", "record", "--audio", "" };
+    try std.testing.expectError(error.InvalidAudioSource, parseFromSlice(&bad_audio));
+
+    const bad_abr = [_][]const u8{ "wlrec", "record", "--audio-bitrate", "8000" };
+    try std.testing.expectError(error.InvalidNumber, parseFromSlice(&bad_abr));
+}
+
+test "parseFromSlice audio options" {
+    const rec_audio = [_][]const u8{
+        "wlrec",           "record",
+        "-o",              "out.mp4",
+        "--audio",         "both",
+        "--audio-bitrate", "192000",
+    };
+    const opts = try parseFromSlice(&rec_audio);
+    try std.testing.expectEqual(common.AudioSourceMode.both, opts.record.audio_mode);
+    try std.testing.expectEqual(@as(u32, 192_000), opts.record.audio_bitrate);
+
+    const rec_custom_src = [_][]const u8{ "wlrec", "record", "--audio", "alsa_input.usb-mic" };
+    const c_opts = try parseFromSlice(&rec_custom_src);
+    try std.testing.expectEqualStrings("alsa_input.usb-mic", c_opts.record.audio_mode.device);
 }
