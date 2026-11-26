@@ -155,7 +155,7 @@ pub const MuxSink = struct {
         }
 
         if (self.target_info.sink_type == .rtmp) {
-            const worker = try rtmp.RtmpWorker.init(self.allocator, self.target_z, video_ctx);
+            const worker = try rtmp.RtmpWorker.init(self.allocator, self.target_z, video_ctx, audio_ctx);
             errdefer worker.deinit();
             try worker.start();
             self.rtmp_worker = worker;
@@ -227,7 +227,7 @@ pub const MuxSink = struct {
     /// Reference, rescale, and write an encoded video packet to the container or RTMP worker.
     pub fn writeVideoPacket(self: *MuxSink, raw_pkt: *const c.AVPacket) MuxError!void {
         if (self.rtmp_worker) |worker| {
-            worker.enqueuePacket(raw_pkt);
+            worker.enqueueVideoPacket(raw_pkt);
             return;
         }
         const stream = self.video_stream orelse return MuxError.PacketWriteFailed;
@@ -236,7 +236,8 @@ pub const MuxSink = struct {
 
     /// Reference, rescale, and write an encoded audio packet to the container or RTMP worker.
     pub fn writeAudioPacket(self: *MuxSink, raw_pkt: *const c.AVPacket) MuxError!void {
-        if (self.rtmp_worker != null) {
+        if (self.rtmp_worker) |worker| {
+            worker.enqueueAudioPacket(raw_pkt);
             return;
         }
         const stream = self.audio_stream orelse return MuxError.PacketWriteFailed;

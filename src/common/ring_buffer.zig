@@ -46,6 +46,16 @@ pub fn SpscRingBuffer(comptime T: type, comptime capacity: usize) type {
             return true;
         }
 
+        /// Inspect the front item without consuming it (consumer-thread only).
+        pub fn peek(self: *const Self) ?T {
+            const t = self.tail.load(.acquire);
+            const h = self.head.load(.acquire);
+            if (h == t) {
+                return null;
+            }
+            return self.buffer[t & mask];
+        }
+
         /// Pop a single item from the ring buffer.
         /// Returns null if the buffer is empty.
         pub fn pop(self: *Self) ?T {
