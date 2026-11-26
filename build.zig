@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
     root_mod.linkSystemLibrary("avformat", .{});
     root_mod.linkSystemLibrary("avfilter", .{});
     root_mod.linkSystemLibrary("avutil", .{});
+    root_mod.linkSystemLibrary("pulse", .{});
     root_mod.linkSystemLibrary("va", .{});
     root_mod.linkSystemLibrary("va-drm", .{});
     root_mod.linkSystemLibrary("drm", .{});
@@ -125,6 +126,7 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.linkSystemLibrary("avformat", .{});
     unit_tests.root_module.linkSystemLibrary("avfilter", .{});
     unit_tests.root_module.linkSystemLibrary("avutil", .{});
+    unit_tests.root_module.linkSystemLibrary("pulse", .{});
     unit_tests.root_module.linkSystemLibrary("va", .{});
     unit_tests.root_module.linkSystemLibrary("va-drm", .{});
     unit_tests.root_module.linkSystemLibrary("drm", .{});
@@ -148,6 +150,7 @@ pub fn build(b: *std.Build) void {
     integration_tests.root_module.linkSystemLibrary("avformat", .{});
     integration_tests.root_module.linkSystemLibrary("avfilter", .{});
     integration_tests.root_module.linkSystemLibrary("avutil", .{});
+    integration_tests.root_module.linkSystemLibrary("pulse", .{});
     integration_tests.root_module.linkSystemLibrary("va", .{});
     integration_tests.root_module.linkSystemLibrary("va-drm", .{});
     integration_tests.root_module.linkSystemLibrary("drm", .{});

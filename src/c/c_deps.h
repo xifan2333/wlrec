@@ -18,6 +18,7 @@
 #include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
 #include <libavutil/hwcontext_vaapi.h>
@@ -25,6 +26,7 @@
 #include <libavutil/pixdesc.h>
 
 #include <drm/drm_fourcc.h>
+#include <pulse/pulseaudio.h>
 #include <va/va.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>

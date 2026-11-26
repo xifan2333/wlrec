@@ -15,6 +15,8 @@ pub const drm_mod_invalid = types.drm_mod_invalid;
 pub const SessionStats = types.SessionStats;
 pub const CaptureSourceType = types.CaptureSourceType;
 pub const MuxSinkType = types.MuxSinkType;
+pub const AudioSourceMode = types.AudioSourceMode;
+pub const AudioSourceParseError = types.AudioSourceParseError;
 
 test {
     @import("std").testing.refAllDecls(@This());
