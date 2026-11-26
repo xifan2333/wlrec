@@ -43,6 +43,35 @@ pub const MuxSinkType = enum {
     rtmp,
 };
 
+pub const AudioSourceParseError = error{
+    InvalidAudioSource,
+};
+
+/// Selected real-time audio capture source mode.
+pub const AudioSourceMode = union(enum) {
+    none,
+    desktop,
+    mic,
+    both,
+    device: []const u8,
+
+    pub fn isEnabled(self: AudioSourceMode) bool {
+        return self != .none;
+    }
+
+    pub fn parse(spec: []const u8) AudioSourceParseError!AudioSourceMode {
+        if (spec.len == 0) return AudioSourceParseError.InvalidAudioSource;
+        if (std.ascii.eqlIgnoreCase(spec, "none")) return .none;
+        if (std.ascii.eqlIgnoreCase(spec, "desktop")) return .desktop;
+        if (std.ascii.eqlIgnoreCase(spec, "mic")) return .mic;
+        if (std.ascii.eqlIgnoreCase(spec, "both")) return .both;
+        if (std.mem.indexOfScalar(u8, spec, 0) != null) {
+            return AudioSourceParseError.InvalidAudioSource;
+        }
+        return .{ .device = spec };
+    }
+};
+
 /// Aggregate recording session metrics returned upon completion.
 pub const SessionStats = struct {
     frames_captured: u64 = 0,
@@ -65,4 +94,27 @@ test "SessionStats averageFps calculation" {
         .duration_ms = 10_000,
     };
     try std.testing.expectEqual(@as(f64, 30.0), stats.averageFps());
+}
+
+test "AudioSourceMode parses built-in modes and custom source names" {
+    const none_mode = try AudioSourceMode.parse("none");
+    try std.testing.expect(!none_mode.isEnabled());
+
+    const desktop_mode = try AudioSourceMode.parse("DESKTOP");
+    try std.testing.expect(desktop_mode.isEnabled());
+    try std.testing.expectEqual(AudioSourceMode.desktop, desktop_mode);
+
+    const mic_mode = try AudioSourceMode.parse("mic");
+    try std.testing.expectEqual(AudioSourceMode.mic, mic_mode);
+
+    const both_mode = try AudioSourceMode.parse("Both");
+    try std.testing.expectEqual(AudioSourceMode.both, both_mode);
+
+    const custom_mode = try AudioSourceMode.parse("alsa_input.usb-mic.mono-fallback");
+    try std.testing.expect(custom_mode.isEnabled());
+    try std.testing.expectEqualStrings("alsa_input.usb-mic.mono-fallback", custom_mode.device);
+
+    try std.testing.expectError(AudioSourceParseError.InvalidAudioSource, AudioSourceMode.parse(""));
+    const nul_spec = [_]u8{ 'b', 'a', 'd', 0, 's', 'r', 'c' };
+    try std.testing.expectError(AudioSourceParseError.InvalidAudioSource, AudioSourceMode.parse(&nul_spec));
 }
