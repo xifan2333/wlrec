@@ -431,6 +431,62 @@ test "MuxSink supportsAudio rejects raw h264 with audio and muxes concurrent A/V
     try std.testing.expect(!raw_sink.supportsAudio());
     try std.testing.expectError(MuxError.UnsupportedTarget, raw_sink.openStreams(vctx, actx));
 
+    const idr_slice_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0 };
+    const aac_frame_bytes = [_]u8{ 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c };
+
+    // Verify >100ms static VFR pause flushes live audio incrementally before finish()
+    {
+        var pause_buf: [128]u8 = undefined;
+        const pause_path = try std.fmt.bufPrint(pause_buf[0 .. pause_buf.len - 1], "{s}/vfr_pause.flv", .{dir_slice});
+        pause_buf[pause_path.len] = 0;
+        const pause_z = pause_buf[0..pause_path.len :0];
+        defer _ = c.unlink(pause_z.ptr);
+
+        var flv_sink = try MuxSink.init(std.testing.allocator, pause_path);
+        defer flv_sink.deinit();
+        try flv_sink.openStreams(vctx, actx);
+
+        const vp = c.av_packet_alloc() orelse return error.OutOfMemory;
+        var vp_opt: ?*c.AVPacket = vp;
+        defer c.av_packet_free(&vp_opt);
+        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(vp, idr_slice_bytes.len));
+        @memcpy(vp.*.data[0..idr_slice_bytes.len], &idr_slice_bytes);
+        vp.*.pts = 0;
+        vp.*.dts = 0;
+        vp.*.flags |= c.AV_PKT_FLAG_KEY;
+        try flv_sink.writeVideoPacket(vp);
+
+        // Emit 12 audio frames (256 ms > 100 ms max_interleave_delta) with no video packets.
+        for (0..12) |i| {
+            const ap = c.av_packet_alloc() orelse return error.OutOfMemory;
+            var ap_opt: ?*c.AVPacket = ap;
+            defer c.av_packet_free(&ap_opt);
+            try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(ap, aac_frame_bytes.len));
+            @memcpy(ap.*.data[0..aac_frame_bytes.len], &aac_frame_bytes);
+            const pts: i64 = @intCast(i * 1024);
+            ap.*.pts = pts;
+            ap.*.dts = pts;
+            ap.*.duration = 1024;
+            try flv_sink.writeAudioPacket(ap);
+        }
+        c.avio_flush(flv_sink.fmt_ctx.?.pb);
+
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), pause_path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        const size_mid_pause = (try file.stat(std.Io.Threaded.global_single_threaded.io())).size;
+        try std.testing.expect(size_mid_pause > 450);
+
+        // Video resumes after the static desktop pause.
+        c.av_packet_unref(vp);
+        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(vp, idr_slice_bytes.len));
+        @memcpy(vp.*.data[0..idr_slice_bytes.len], &idr_slice_bytes);
+        vp.*.pts = 300;
+        vp.*.dts = 300;
+        vp.*.flags |= c.AV_PKT_FLAG_KEY;
+        try flv_sink.writeVideoPacket(vp);
+        try flv_sink.finish();
+    }
+
     const exts = [_][]const u8{ "mp4", "mkv", "flv" };
     for (exts) |ext| {
         var path_buf: [128]u8 = undefined;

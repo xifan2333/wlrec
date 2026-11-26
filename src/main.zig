@@ -60,10 +60,11 @@ fn printRecordSummary(
             stats.audio_frames_encoded,
         });
     }
-    if (stats.packets_dropped > 0 or stats.reconnects > 0 or stats.audio_packets_dropped > 0) {
-        try stdout.print(" ({} video/mux dropped, {} audio dropped, {} reconnects)", .{
+    if (stats.packets_dropped > 0 or stats.reconnects > 0 or stats.audio_packets_dropped > 0 or stats.audio_frames_dropped > 0) {
+        try stdout.print(" ({} video/mux dropped, {} audio pkts dropped, {} pcm frames dropped, {} reconnects)", .{
             stats.packets_dropped,
             stats.audio_packets_dropped,
+            stats.audio_frames_dropped,
             stats.reconnects,
         });
     }

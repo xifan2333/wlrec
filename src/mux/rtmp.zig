@@ -581,7 +581,11 @@ test "RtmpWorker handles unreachable endpoint without blocking and cleans up" {
     var ctx_opt: ?*c.AVCodecContext = ctx;
     defer c.avcodec_free_context(&ctx_opt);
 
-    const worker = try RtmpWorker.init(std.testing.allocator, "rtmp://127.0.0.1:19359/live/test", ctx, null);
+    const actx = try sink.allocTestAacContext();
+    var actx_opt: ?*c.AVCodecContext = actx;
+    defer c.avcodec_free_context(&actx_opt);
+
+    const worker = try RtmpWorker.init(std.testing.allocator, "rtmp://127.0.0.1:19359/live/test", ctx, actx);
     defer worker.deinit();
 
     try worker.start();
@@ -592,7 +596,15 @@ test "RtmpWorker handles unreachable endpoint without blocking and cleans up" {
     try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(pkt, 32));
     pkt.*.flags |= c.AV_PKT_FLAG_KEY;
 
+    const apkt = c.av_packet_alloc() orelse return error.OutOfMemory;
+    var apkt_opt: ?*c.AVPacket = apkt;
+    defer c.av_packet_free(&apkt_opt);
+    try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(apkt, 16));
+    apkt.*.pts = 1024;
+    apkt.*.dts = 1024;
+
     worker.enqueueVideoPacket(pkt);
+    worker.enqueueAudioPacket(apkt);
     worker.enqueueVideoPacket(pkt);
 
     const sleep_ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 30_000_000 };
@@ -601,5 +613,5 @@ test "RtmpWorker handles unreachable endpoint without blocking and cleans up" {
     worker.stopAndJoin();
     const stats = worker.getStats();
     try std.testing.expectEqual(@as(u64, 0), stats.packets_written);
-    try std.testing.expectEqual(@as(u64, 2), stats.packets_dropped);
+    try std.testing.expectEqual(@as(u64, 3), stats.packets_dropped);
 }

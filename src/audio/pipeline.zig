@@ -247,6 +247,10 @@ pub const AudioPipeline = struct {
         return self.out_wake.fd;
     }
 
+    pub fn ackPacketReady(self: *const AudioPipeline) void {
+        self.out_wake.clear();
+    }
+
     pub fn start(self: *AudioPipeline) AudioPipelineError!void {
         if (self.thread != null) return;
         self.thread = std.Thread.spawn(.{}, pumpThreadMain, .{self}) catch {

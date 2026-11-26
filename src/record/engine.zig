@@ -43,6 +43,7 @@ pub const RecordStats = struct {
     first_keyframe_seen: bool = false,
     audio_frames_captured: u64 = 0,
     audio_frames_encoded: u64 = 0,
+    audio_frames_dropped: u64 = 0,
     audio_packets_dropped: u64 = 0,
 };
 
@@ -180,15 +181,6 @@ const AudioMuxForwarder = struct {
         self.stop_wake.deinit();
     }
 
-    fn clearFd(fd: std.posix.fd_t) void {
-        var val: u64 = 0;
-        _ = std.posix.read(fd, std.mem.asBytes(&val)) catch |err| {
-            if (err != error.WouldBlock) {
-                std.log.debug("audio forwarder eventfd clear: {s}", .{@errorName(err)});
-            }
-        };
-    }
-
     fn drainAvailable(self: *AudioMuxForwarder) void {
         while (self.pipeline.popPacket()) |pkt_val| {
             var pkt = pkt_val;
@@ -215,7 +207,7 @@ const AudioMuxForwarder = struct {
                 continue;
             };
             if (ready > 0 and (pfds[0].revents & std.posix.POLL.IN) != 0) {
-                clearFd(pkt_fd);
+                self.pipeline.ackPacketReady();
             }
         }
         self.drainAvailable();
@@ -258,7 +250,8 @@ fn flushRecording(
         const a_stats = ap.getStats();
         stats.audio_frames_captured = a_stats.frames_captured;
         stats.audio_frames_encoded = a_stats.frames_encoded;
-        stats.audio_packets_dropped = a_stats.packets_dropped + a_stats.frames_dropped;
+        stats.audio_frames_dropped = a_stats.frames_dropped;
+        stats.audio_packets_dropped = a_stats.packets_dropped;
     }
 
     sink.finish() catch |err| return mapMuxError(err);
@@ -444,13 +437,6 @@ fn recordLoop(ctx: *RecordingContext) !void {
     }
 }
 
-fn openCaptureSession(allocator: std.mem.Allocator, session: *capture.CopyCaptureSession) !void {
-    session.init(allocator, null) catch |err| {
-        if (err == capture.CaptureError.OutOfMemory) return error.OutOfMemory;
-        return error.WaylandConnectFailed;
-    };
-}
-
 fn runSessionPipeline(
     session: *capture.CopyCaptureSession,
     device: *encode.VaapiDevice,
@@ -527,7 +513,10 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
     defer if (maybe_audio) |ap| ap.deinit();
 
     var session: capture.CopyCaptureSession = .{};
-    try openCaptureSession(allocator, &session);
+    session.init(allocator, null) catch |err| {
+        if (err == capture.CaptureError.OutOfMemory) return error.OutOfMemory;
+        return error.WaylandConnectFailed;
+    };
     defer session.deinit();
 
     var device = encode.VaapiDevice.init(
