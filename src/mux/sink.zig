@@ -3,6 +3,8 @@ const c = @import("c");
 const common = @import("../common/lib.zig");
 const rtmp = @import("rtmp.zig");
 
+pub const interleave_delta_us: i64 = 100_000;
+
 pub const MuxError = error{
     OutOfMemory,
     UnsupportedTarget,
@@ -78,11 +80,15 @@ pub const MuxSink = struct {
     fmt_ctx: ?*c.AVFormatContext = null,
     scratch_pkt: ?*c.AVPacket = null,
     video_stream: ?*c.AVStream = null,
-    src_time_base: c.AVRational = .{ .num = 1, .den = 1000 },
+    audio_stream: ?*c.AVStream = null,
+    video_src_time_base: c.AVRational = .{ .num = 1, .den = 1000 },
+    audio_src_time_base: c.AVRational = .{ .num = 1, .den = 48000 },
     header_written: bool = false,
     finished: bool = false,
     rtmp_worker: ?*rtmp.RtmpWorker = null,
-    stats: MuxStats = .{},
+    write_mutex: std.Io.Mutex = .init,
+    file_packets_written: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    file_bytes_written: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Allocate the FFmpeg output format context without performing disk or network I/O.
     pub fn init(allocator: std.mem.Allocator, target: []const u8) MuxError!MuxSink {
@@ -109,6 +115,11 @@ pub const MuxSink = struct {
         };
     }
 
+    /// Return true when the container supports an audio track alongside video.
+    pub fn supportsAudio(self: *const MuxSink) bool {
+        return !std.mem.eql(u8, self.target_info.format_name, "h264");
+    }
+
     /// Return true when the container requires AV_CODEC_FLAG_GLOBAL_HEADER before avcodec_open2.
     pub fn needsGlobalHeader(self: *const MuxSink) bool {
         if (self.target_info.sink_type == .rtmp) return true;
@@ -116,10 +127,35 @@ pub const MuxSink = struct {
         return (ctx.*.oformat.*.flags & c.AVFMT_GLOBALHEADER) != 0;
     }
 
-    /// Create the video stream from an opened encoder context, open the output, and write the header.
-    pub fn openVideoStream(self: *MuxSink, codec_ctx: *const c.AVCodecContext) MuxError!void {
+    fn registerStream(
+        ctx: *c.AVFormatContext,
+        codec_ctx: *const c.AVCodecContext,
+        is_video: bool,
+    ) MuxError!*c.AVStream {
+        const stream = c.avformat_new_stream(ctx, null) orelse return MuxError.StreamAllocFailed;
+        stream.*.id = @intCast(ctx.*.nb_streams - 1);
+        stream.*.time_base = codec_ctx.*.time_base;
+        if (is_video and codec_ctx.*.framerate.num > 0 and codec_ctx.*.framerate.den > 0) {
+            stream.*.avg_frame_rate = codec_ctx.*.framerate;
+        }
+        if (c.avcodec_parameters_from_context(stream.*.codecpar, codec_ctx) < 0) {
+            return MuxError.CodecParamsCopyFailed;
+        }
+        return stream;
+    }
+
+    /// Create video and optional audio streams, open the output, and write the container header.
+    pub fn openStreams(
+        self: *MuxSink,
+        video_ctx: *const c.AVCodecContext,
+        audio_ctx: ?*const c.AVCodecContext,
+    ) MuxError!void {
+        if (audio_ctx != null and !self.supportsAudio()) {
+            return MuxError.UnsupportedTarget;
+        }
+
         if (self.target_info.sink_type == .rtmp) {
-            const worker = try rtmp.RtmpWorker.init(self.allocator, self.target_z, codec_ctx);
+            const worker = try rtmp.RtmpWorker.init(self.allocator, self.target_z, video_ctx, audio_ctx);
             errdefer worker.deinit();
             try worker.start();
             self.rtmp_worker = worker;
@@ -128,19 +164,17 @@ pub const MuxSink = struct {
         }
 
         const ctx = self.fmt_ctx orelse return MuxError.MuxContextAllocFailed;
-        const stream = c.avformat_new_stream(ctx, null) orelse return MuxError.StreamAllocFailed;
-        stream.*.id = @intCast(ctx.*.nb_streams - 1);
-        stream.*.time_base = codec_ctx.*.time_base;
-        if (codec_ctx.*.framerate.num > 0 and codec_ctx.*.framerate.den > 0) {
-            stream.*.avg_frame_rate = codec_ctx.*.framerate;
+        const v_stream = try registerStream(ctx, video_ctx, true);
+        self.video_stream = v_stream;
+        self.video_src_time_base = video_ctx.*.time_base;
+
+        if (audio_ctx) |actx| {
+            self.audio_stream = try registerStream(ctx, actx, false);
+            self.audio_src_time_base = actx.*.time_base;
         }
 
-        if (c.avcodec_parameters_from_context(stream.*.codecpar, codec_ctx) < 0) {
-            return MuxError.CodecParamsCopyFailed;
-        }
-
-        self.src_time_base = codec_ctx.*.time_base;
-        self.video_stream = stream;
+        // Bound sparse-stream interleave buffering so static VFR pauses do not stall live audio.
+        ctx.*.max_interleave_delta = interleave_delta_us;
 
         if ((ctx.*.oformat.*.flags & c.AVFMT_NOFILE) == 0) {
             if (c.avio_open(&ctx.*.pb, self.target_z.ptr, c.AVIO_FLAG_WRITE) < 0) {
@@ -155,24 +189,26 @@ pub const MuxSink = struct {
         self.header_written = true;
     }
 
-    /// Reference, rescale, and write an encoded packet to the container or non-blocking RTMP queue.
-    pub fn writePacket(self: *MuxSink, raw_pkt: *const c.AVPacket) MuxError!void {
-        if (self.rtmp_worker) |worker| {
-            worker.enqueuePacket(raw_pkt);
-            return;
-        }
-
+    fn writeFilePacket(
+        self: *MuxSink,
+        stream: *c.AVStream,
+        src_tb: c.AVRational,
+        raw_pkt: *const c.AVPacket,
+    ) MuxError!void {
         const ctx = self.fmt_ctx orelse return MuxError.PacketWriteFailed;
-        const stream = self.video_stream orelse return MuxError.PacketWriteFailed;
         const out_pkt = self.scratch_pkt orelse return MuxError.PacketWriteFailed;
         if (!self.header_written) return MuxError.PacketWriteFailed;
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.write_mutex.lockUncancelable(io);
+        defer self.write_mutex.unlock(io);
 
         if (c.av_packet_ref(out_pkt, raw_pkt) < 0) {
             return MuxError.PacketWriteFailed;
         }
         defer c.av_packet_unref(out_pkt);
 
-        c.av_packet_rescale_ts(out_pkt, self.src_time_base, stream.*.time_base);
+        c.av_packet_rescale_ts(out_pkt, src_tb, stream.*.time_base);
         out_pkt.*.stream_index = stream.*.index;
         out_pkt.*.pos = -1;
 
@@ -180,8 +216,28 @@ pub const MuxSink = struct {
         if (c.av_interleaved_write_frame(ctx, out_pkt) < 0) {
             return MuxError.PacketWriteFailed;
         }
-        self.stats.bytes_written += pkt_bytes;
-        self.stats.packets_written += 1;
+        _ = self.file_bytes_written.fetchAdd(pkt_bytes, .monotonic);
+        _ = self.file_packets_written.fetchAdd(1, .monotonic);
+    }
+
+    /// Reference, rescale, and write an encoded video packet to the container or RTMP worker.
+    pub fn writeVideoPacket(self: *MuxSink, raw_pkt: *const c.AVPacket) MuxError!void {
+        if (self.rtmp_worker) |worker| {
+            worker.enqueueVideoPacket(raw_pkt);
+            return;
+        }
+        const stream = self.video_stream orelse return MuxError.PacketWriteFailed;
+        return self.writeFilePacket(stream, self.video_src_time_base, raw_pkt);
+    }
+
+    /// Reference, rescale, and write an encoded audio packet to the container or RTMP worker.
+    pub fn writeAudioPacket(self: *MuxSink, raw_pkt: *const c.AVPacket) MuxError!void {
+        if (self.rtmp_worker) |worker| {
+            worker.enqueueAudioPacket(raw_pkt);
+            return;
+        }
+        const stream = self.audio_stream orelse return MuxError.PacketWriteFailed;
+        return self.writeFilePacket(stream, self.audio_src_time_base, raw_pkt);
     }
 
     /// Flush buffered packets, write the container trailer, and close the output handle.
@@ -191,7 +247,6 @@ pub const MuxSink = struct {
 
         if (self.rtmp_worker) |worker| {
             worker.stopAndJoin();
-            self.stats = worker.getStats();
             return;
         }
 
@@ -210,7 +265,10 @@ pub const MuxSink = struct {
         if (self.rtmp_worker) |worker| {
             return worker.getStats();
         }
-        return self.stats;
+        return .{
+            .packets_written = self.file_packets_written.load(.monotonic),
+            .bytes_written = self.file_bytes_written.load(.monotonic),
+        };
     }
 
     pub fn deinit(self: *MuxSink) void {
@@ -296,11 +354,164 @@ pub fn allocTestH264Context(with_extradata: bool) !*c.AVCodecContext {
     return ctx;
 }
 
-test "MuxSink writes valid MP4, MKV, FLV, and H264 files with synthetic packets" {
-    const idr_slice_bytes = [_]u8{
-        0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0,
-    };
+pub fn allocTestAacContext() !*c.AVCodecContext {
+    const codec = c.avcodec_find_encoder_by_name("aac") orelse
+        c.avcodec_find_encoder(c.AV_CODEC_ID_AAC) orelse
+        return error.OutOfMemory;
+    const ctx = c.avcodec_alloc_context3(codec) orelse return error.OutOfMemory;
+    errdefer {
+        var ctx_opt: ?*c.AVCodecContext = ctx;
+        c.avcodec_free_context(&ctx_opt);
+    }
 
+    c.av_channel_layout_default(&ctx.*.ch_layout, 2);
+    ctx.*.sample_rate = 48_000;
+    ctx.*.sample_fmt = c.AV_SAMPLE_FMT_FLTP;
+    ctx.*.bit_rate = 128_000;
+    ctx.*.time_base = .{ .num = 1, .den = 48_000 };
+    ctx.*.flags |= c.AV_CODEC_FLAG_GLOBAL_HEADER;
+    if (c.avcodec_open2(ctx, codec, null) < 0) return error.OutOfMemory;
+    return ctx;
+}
+
+fn sendTestVideoBatch(sink_ptr: *MuxSink) !void {
+    const idr_slice_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0 };
+    for ([_]i64{ 0, 33, 100 }, 0..) |pts, idx| {
+        const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
+        var pkt_opt: ?*c.AVPacket = pkt;
+        defer c.av_packet_free(&pkt_opt);
+        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(pkt, idr_slice_bytes.len));
+        @memcpy(pkt.*.data[0..idr_slice_bytes.len], &idr_slice_bytes);
+        pkt.*.pts = pts;
+        pkt.*.dts = pts;
+        pkt.*.duration = 33;
+        if (idx == 0) pkt.*.flags |= c.AV_PKT_FLAG_KEY;
+        try sink_ptr.writeVideoPacket(pkt);
+    }
+}
+
+fn sendTestAudioBatch(sink_ptr: *MuxSink) !void {
+    const aac_frame_bytes = [_]u8{ 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c };
+    for (0..6) |idx| {
+        const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
+        var pkt_opt: ?*c.AVPacket = pkt;
+        defer c.av_packet_free(&pkt_opt);
+        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(pkt, aac_frame_bytes.len));
+        @memcpy(pkt.*.data[0..aac_frame_bytes.len], &aac_frame_bytes);
+        const sample_pts: i64 = @as(i64, @intCast(idx)) * 1024 - 1024;
+        pkt.*.pts = sample_pts;
+        pkt.*.dts = sample_pts;
+        pkt.*.duration = 1024;
+        try sink_ptr.writeAudioPacket(pkt);
+    }
+}
+
+test "MuxSink supportsAudio rejects raw h264 with audio and muxes concurrent A/V streams" {
+    const prev_log = c.av_log_get_level();
+    c.av_log_set_level(c.AV_LOG_ERROR);
+    defer c.av_log_set_level(prev_log);
+
+    const vctx = try allocTestH264Context(true);
+    var vctx_opt: ?*c.AVCodecContext = vctx;
+    defer c.avcodec_free_context(&vctx_opt);
+
+    const actx = try allocTestAacContext();
+    var actx_opt: ?*c.AVCodecContext = actx;
+    defer c.avcodec_free_context(&actx_opt);
+
+    var dir_tpl = "/tmp/wlrec-avmux-test-XXXXXX".*;
+    const dir_ptr = c.mkdtemp(&dir_tpl[0]) orelse return error.TempDirFailed;
+    const dir_slice = std.mem.span(dir_ptr);
+    defer _ = c.rmdir(dir_ptr);
+
+    var h264_buf: [128]u8 = undefined;
+    const h264_path = try std.fmt.bufPrint(&h264_buf, "{s}/raw.h264", .{dir_slice});
+    var raw_sink = try MuxSink.init(std.testing.allocator, h264_path);
+    defer raw_sink.deinit();
+    try std.testing.expect(!raw_sink.supportsAudio());
+    try std.testing.expectError(MuxError.UnsupportedTarget, raw_sink.openStreams(vctx, actx));
+
+    const idr_slice_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0 };
+    const aac_frame_bytes = [_]u8{ 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c };
+
+    // Verify >100ms static VFR pause flushes live audio incrementally before finish()
+    {
+        var pause_buf: [128]u8 = undefined;
+        const pause_path = try std.fmt.bufPrint(pause_buf[0 .. pause_buf.len - 1], "{s}/vfr_pause.flv", .{dir_slice});
+        pause_buf[pause_path.len] = 0;
+        const pause_z = pause_buf[0..pause_path.len :0];
+        defer _ = c.unlink(pause_z.ptr);
+
+        var flv_sink = try MuxSink.init(std.testing.allocator, pause_path);
+        defer flv_sink.deinit();
+        try flv_sink.openStreams(vctx, actx);
+
+        const vp = c.av_packet_alloc() orelse return error.OutOfMemory;
+        var vp_opt: ?*c.AVPacket = vp;
+        defer c.av_packet_free(&vp_opt);
+        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(vp, idr_slice_bytes.len));
+        @memcpy(vp.*.data[0..idr_slice_bytes.len], &idr_slice_bytes);
+        vp.*.pts = 0;
+        vp.*.dts = 0;
+        vp.*.flags |= c.AV_PKT_FLAG_KEY;
+        try flv_sink.writeVideoPacket(vp);
+
+        // Emit 12 audio frames (256 ms > 100 ms max_interleave_delta) with no video packets.
+        for (0..12) |i| {
+            const ap = c.av_packet_alloc() orelse return error.OutOfMemory;
+            var ap_opt: ?*c.AVPacket = ap;
+            defer c.av_packet_free(&ap_opt);
+            try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(ap, aac_frame_bytes.len));
+            @memcpy(ap.*.data[0..aac_frame_bytes.len], &aac_frame_bytes);
+            const pts: i64 = @intCast(i * 1024);
+            ap.*.pts = pts;
+            ap.*.dts = pts;
+            ap.*.duration = 1024;
+            try flv_sink.writeAudioPacket(ap);
+        }
+        c.avio_flush(flv_sink.fmt_ctx.?.pb);
+
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), pause_path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        const size_mid_pause = (try file.stat(std.Io.Threaded.global_single_threaded.io())).size;
+        try std.testing.expect(size_mid_pause > 450);
+
+        // Video resumes after the static desktop pause.
+        c.av_packet_unref(vp);
+        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(vp, idr_slice_bytes.len));
+        @memcpy(vp.*.data[0..idr_slice_bytes.len], &idr_slice_bytes);
+        vp.*.pts = 300;
+        vp.*.dts = 300;
+        vp.*.flags |= c.AV_PKT_FLAG_KEY;
+        try flv_sink.writeVideoPacket(vp);
+        try flv_sink.finish();
+    }
+
+    const exts = [_][]const u8{ "mp4", "mkv", "flv" };
+    for (exts) |ext| {
+        var path_buf: [128]u8 = undefined;
+        const path_slice = try std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], "{s}/av.{s}", .{ dir_slice, ext });
+        path_buf[path_slice.len] = 0;
+        const path_z = path_buf[0..path_slice.len :0];
+        defer _ = c.unlink(path_z.ptr);
+
+        var av_sink = try MuxSink.init(std.testing.allocator, path_slice);
+        defer av_sink.deinit();
+        try std.testing.expect(av_sink.supportsAudio());
+        try av_sink.openStreams(vctx, actx);
+
+        const audio_thread = try std.Thread.spawn(.{}, sendTestAudioBatch, .{&av_sink});
+        try sendTestVideoBatch(&av_sink);
+        audio_thread.join();
+
+        try av_sink.finish();
+        const stats = av_sink.getStats();
+        try std.testing.expectEqual(@as(u64, 9), stats.packets_written);
+        try std.testing.expect(stats.bytes_written > 0);
+    }
+}
+
+test "MuxSink writes valid MP4, MKV, FLV, and H264 files with synthetic packets" {
     var dir_tpl = "/tmp/wlrec-mux-test-XXXXXX".*;
     const dir_ptr = c.mkdtemp(&dir_tpl[0]) orelse return error.TempDirFailed;
     const dir_slice = std.mem.span(dir_ptr);
@@ -324,23 +535,8 @@ test "MuxSink writes valid MP4, MKV, FLV, and H264 files with synthetic packets"
         var ctx_opt: ?*c.AVCodecContext = ctx;
         defer c.avcodec_free_context(&ctx_opt);
 
-        try sink.openVideoStream(ctx);
-
-        const pts_vals = [_]i64{ 0, 33, 100 };
-        for (pts_vals, 0..) |pts, idx| {
-            const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
-            var pkt_opt: ?*c.AVPacket = pkt;
-            defer c.av_packet_free(&pkt_opt);
-
-            try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(pkt, idr_slice_bytes.len));
-            @memcpy(pkt.*.data[0..idr_slice_bytes.len], &idr_slice_bytes);
-            pkt.*.pts = pts;
-            pkt.*.dts = pts;
-            pkt.*.duration = 33;
-            if (idx == 0) pkt.*.flags |= c.AV_PKT_FLAG_KEY;
-
-            try sink.writePacket(pkt);
-        }
+        try sink.openStreams(ctx, null);
+        try sendTestVideoBatch(&sink);
 
         try sink.finish();
         const stats = sink.getStats();

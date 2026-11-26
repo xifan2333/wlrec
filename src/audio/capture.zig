@@ -47,12 +47,17 @@ pub const EventFd = struct {
         }
     }
 
+    pub fn clear(self: *const EventFd) void {
+        if (self.fd < 0) return;
+        var val: u64 = 0;
+        _ = c.read(self.fd, &val, @sizeOf(u64));
+    }
+
     pub fn wait(self: *const EventFd, timeout_ms: c_int) void {
         if (self.fd < 0) return;
         var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
         if (c.poll(&pfd, 1, timeout_ms) > 0) {
-            var val: u64 = 0;
-            _ = c.read(self.fd, &val, @sizeOf(u64));
+            self.clear();
         }
     }
 };

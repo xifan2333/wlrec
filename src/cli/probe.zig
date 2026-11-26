@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("c");
 const capture = @import("../capture/lib.zig");
+const audio = @import("../audio/lib.zig");
 
 pub const ProbeResult = struct {
     wayland_ok: bool = false,
@@ -13,6 +14,10 @@ pub const ProbeResult = struct {
     vpp_ok: bool = false,
     driver_name: [64]u8 = undefined,
     driver_name_len: usize = 0,
+
+    audio_ok: bool = false,
+    audio_monitor_ok: bool = false,
+    audio_mic_ok: bool = false,
 };
 
 fn probeWayland(writer: anytype, result: *ProbeResult) !void {
@@ -101,6 +106,30 @@ fn probeVaapi(writer: anytype, result: *ProbeResult) !void {
     try writer.print("  VideoProc (GPU Scaling): {s}\n", .{if (result.vpp_ok) "SUPPORTED" else "NO"});
 }
 
+fn probeAudio(writer: anytype, result: *ProbeResult) !void {
+    try writer.writeAll("\n[Audio (PulseAudio / PipeWire)]\n");
+    const report = audio.probePulseAudio();
+    if (!report.available) {
+        try writer.writeAll("  Status: UNAVAILABLE (no PulseAudio/PipeWire-Pulse daemon reachable)\n");
+        return;
+    }
+
+    result.audio_ok = true;
+    result.audio_monitor_ok = report.monitor_available;
+    result.audio_mic_ok = report.mic_available;
+
+    const srv = if (report.serverName().len > 0) report.serverName() else "Unknown";
+    try writer.print("  Server: {s}\n", .{srv});
+    try writer.print("  Desktop Monitor (@DEFAULT_MONITOR@): {s} ({s})\n", .{
+        if (result.audio_monitor_ok) "YES" else "MISSING",
+        if (report.defaultSink().len > 0) report.defaultSink() else "none",
+    });
+    try writer.print("  Microphone (@DEFAULT_SOURCE@):      {s} ({s})\n", .{
+        if (result.audio_mic_ok) "YES" else "MISSING",
+        if (report.defaultSource().len > 0) report.defaultSource() else "none",
+    });
+}
+
 /// Run system environment and hardware acceleration probe.
 pub fn runProbe(writer: anytype) !ProbeResult {
     var result = ProbeResult{};
@@ -109,6 +138,7 @@ pub fn runProbe(writer: anytype) !ProbeResult {
 
     try probeWayland(writer, &result);
     try probeVaapi(writer, &result);
+    try probeAudio(writer, &result);
 
     try writer.writeAll("\n[Verdict]\n");
     const fully_supported = result.wayland_ok and result.copy_capture_ok and result.source_mgr_ok and
@@ -126,4 +156,5 @@ pub fn runProbe(writer: anytype) !ProbeResult {
 test "ProbeResult struct check" {
     const res = ProbeResult{};
     try std.testing.expect(!res.wayland_ok);
+    try std.testing.expect(!res.audio_ok);
 }

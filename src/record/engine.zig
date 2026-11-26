@@ -2,6 +2,7 @@ const std = @import("std");
 const common = @import("../common/lib.zig");
 const capture = @import("../capture/lib.zig");
 const encode = @import("../encode/lib.zig");
+const audio = @import("../audio/lib.zig");
 const mux = @import("../mux/lib.zig");
 
 pub const RecordError = error{
@@ -12,6 +13,7 @@ pub const RecordError = error{
     BufferImportFailed,
     FilterInitFailed,
     EncoderInitFailed,
+    AudioInitFailed,
     CaptureFailed,
     EncodeFailed,
     UnsupportedTarget,
@@ -25,6 +27,8 @@ pub const RecordConfig = struct {
     fps: u32 = 60,
     qp: u8 = 23,
     bitrate: ?u32 = null,
+    audio_mode: common.AudioSourceMode = .none,
+    audio_bitrate: u32 = audio.default_bitrate_bps,
     max_frames: ?u64 = null,
     duration_secs: u64 = 0,
     stop_fd: ?std.posix.fd_t = null,
@@ -37,6 +41,10 @@ pub const RecordStats = struct {
     packets_dropped: u64 = 0,
     reconnects: u64 = 0,
     first_keyframe_seen: bool = false,
+    audio_frames_captured: u64 = 0,
+    audio_frames_encoded: u64 = 0,
+    audio_frames_dropped: u64 = 0,
+    audio_packets_dropped: u64 = 0,
 };
 
 pub const SurfaceSlot = struct {
@@ -120,7 +128,7 @@ fn drainEncoderPackets(encoder: *encode.VaapiEncoder, sink: *mux.MuxSink, stats:
         var pkt = pkt_val;
         defer pkt.deinit();
         if (pkt.is_keyframe) stats.first_keyframe_seen = true;
-        sink.writePacket(pkt.raw_packet) catch |err| return mapMuxError(err);
+        sink.writeVideoPacket(pkt.raw_packet) catch |err| return mapMuxError(err);
         stats.frames_encoded += 1;
     }
 }
@@ -132,9 +140,120 @@ fn syncMuxStats(sink: *const mux.MuxSink, stats: *RecordStats) void {
     stats.reconnects = m.reconnects;
 }
 
-fn flushRecording(encoder: *encode.VaapiEncoder, sink: *mux.MuxSink, stats: *RecordStats) !void {
+fn mapAudioError(err: audio.AudioPipelineError) (RecordError || error{OutOfMemory}) {
+    return if (err == audio.AudioPipelineError.OutOfMemory) error.OutOfMemory else error.AudioInitFailed;
+}
+
+const AudioMuxForwarder = struct {
+    pipeline: *audio.AudioPipeline,
+    sink: *mux.MuxSink,
+    stop_wake: audio.EventFd,
+    stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    write_error: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    fn init(pipeline: *audio.AudioPipeline, sink: *mux.MuxSink) !AudioMuxForwarder {
+        const stop_wake = audio.EventFd.init() catch return error.AudioInitFailed;
+        return .{
+            .pipeline = pipeline,
+            .sink = sink,
+            .stop_wake = stop_wake,
+        };
+    }
+
+    fn start(self: *AudioMuxForwarder, t0_ns: ?u64) !void {
+        if (t0_ns) |ns| self.pipeline.setSessionStartNs(ns);
+        if (self.thread != null) return;
+        self.thread = std.Thread.spawn(.{}, threadMain, .{self}) catch return error.AudioInitFailed;
+    }
+
+    fn stopAndJoin(self: *AudioMuxForwarder) void {
+        self.stop_requested.store(true, .release);
+        self.stop_wake.signaler().notify();
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+
+    fn deinit(self: *AudioMuxForwarder) void {
+        self.stopAndJoin();
+        self.stop_wake.deinit();
+    }
+
+    fn drainAvailable(self: *AudioMuxForwarder) void {
+        while (self.pipeline.popPacket()) |pkt_val| {
+            var pkt = pkt_val;
+            defer pkt.deinit();
+            if (self.write_error.load(.acquire)) continue;
+            self.sink.writeAudioPacket(pkt.raw_packet) catch |err| {
+                std.log.warn("audio mux write failed: {s}", .{@errorName(err)});
+                self.write_error.store(true, .release);
+            };
+        }
+    }
+
+    fn threadMain(self: *AudioMuxForwarder) void {
+        const pkt_fd = self.pipeline.packetReadyFd();
+        while (!self.stop_requested.load(.acquire)) {
+            self.drainAvailable();
+            if (self.stop_requested.load(.acquire)) break;
+            var pfds = [_]std.posix.pollfd{
+                .{ .fd = pkt_fd, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = self.stop_wake.fd, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const ready = std.posix.poll(&pfds, 25) catch |err| {
+                std.log.debug("audio forwarder poll: {s}", .{@errorName(err)});
+                continue;
+            };
+            if (ready > 0 and (pfds[0].revents & std.posix.POLL.IN) != 0) {
+                self.pipeline.ackPacketReady();
+            }
+        }
+        self.drainAvailable();
+    }
+};
+
+fn initAudioPipelineIfEnabled(
+    allocator: std.mem.Allocator,
+    config: RecordConfig,
+    global_header: bool,
+) !?*audio.AudioPipeline {
+    if (!config.audio_mode.isEnabled()) return null;
+    const ap = audio.AudioPipeline.init(
+        allocator,
+        config.audio_mode,
+        config.audio_bitrate,
+        global_header,
+    ) catch |err| return mapAudioError(err);
+    errdefer ap.deinit();
+    ap.start() catch |err| return mapAudioError(err);
+    return ap;
+}
+
+fn flushRecording(
+    encoder: *encode.VaapiEncoder,
+    sink: *mux.MuxSink,
+    maybe_audio: ?*audio.AudioPipeline,
+    forwarder: *?AudioMuxForwarder,
+    stats: *RecordStats,
+) !void {
     encoder.sendFrame(null) catch return error.EncodeFailed;
     try drainEncoderPackets(encoder, sink, stats);
+
+    if (maybe_audio) |ap| {
+        ap.stopAndFlush();
+        if (forwarder.*) |*fwd| {
+            fwd.stopAndJoin();
+            if (fwd.write_error.load(.acquire)) return error.MuxWriteFailed;
+        }
+        const a_stats = ap.getStats();
+        stats.audio_frames_captured = a_stats.frames_captured;
+        stats.audio_frames_encoded = a_stats.frames_encoded;
+        stats.audio_frames_dropped = a_stats.frames_dropped;
+        stats.audio_packets_dropped = a_stats.packets_dropped;
+    }
+
     sink.finish() catch |err| return mapMuxError(err);
     syncMuxStats(sink, stats);
 }
@@ -318,12 +437,80 @@ fn recordLoop(ctx: *RecordingContext) !void {
     }
 }
 
+fn runSessionPipeline(
+    session: *capture.CopyCaptureSession,
+    device: *encode.VaapiDevice,
+    slots: *[2]SurfaceSlot,
+    config: RecordConfig,
+    deadline_ms: ?u64,
+    clock: *common.VfrClock,
+    sink: *mux.MuxSink,
+    maybe_audio: ?*audio.AudioPipeline,
+    stats: *RecordStats,
+) !void {
+    const init_res = initFirstFrame(
+        session,
+        device,
+        slots,
+        deadline_ms,
+        clock,
+        config,
+        sink.needsGlobalHeader(),
+    ) catch |err| {
+        if (isGracefulStop(err)) return;
+        return err;
+    };
+    var filter = init_res.filter;
+    defer filter.deinit();
+    var encoder = init_res.encoder;
+    defer encoder.deinit();
+    stats.frames_captured += 1;
+
+    const audio_ctx = if (maybe_audio) |ap| ap.enc.codec_ctx else null;
+    sink.openStreams(encoder.codec_ctx, audio_ctx) catch |err| return mapMuxError(err);
+
+    var forwarder: ?AudioMuxForwarder = if (maybe_audio) |ap|
+        try AudioMuxForwarder.init(ap, sink)
+    else
+        null;
+    defer if (forwarder) |*fwd| fwd.deinit();
+    if (forwarder) |*fwd| try fwd.start(clock.start_ns);
+
+    {
+        var first_out = init_res.first_out;
+        defer first_out.deinit();
+        encoder.sendFrame(&first_out) catch return error.EncodeFailed;
+    }
+    try drainEncoderPackets(&encoder, sink, stats);
+
+    var ctx = RecordingContext{
+        .session = session,
+        .device = device,
+        .slots = slots,
+        .filter = &filter,
+        .encoder = &encoder,
+        .clock = clock,
+        .config = &config,
+        .deadline_ms = deadline_ms,
+        .sink = sink,
+        .stats = stats,
+    };
+    try recordLoop(&ctx);
+    try flushRecording(&encoder, sink, maybe_audio, &forwarder, stats);
+}
+
 /// Run end-to-end zero-copy screen recording session.
 pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordStats {
     var stats = RecordStats{};
 
     var sink = mux.MuxSink.init(allocator, config.output_path) catch |err| return mapMuxError(err);
     defer sink.deinit();
+    if (config.audio_mode.isEnabled() and !sink.supportsAudio()) {
+        return error.UnsupportedTarget;
+    }
+
+    const maybe_audio = try initAudioPipelineIfEnabled(allocator, config, sink.needsGlobalHeader());
+    defer if (maybe_audio) |ap| ap.deinit();
 
     var session: capture.CopyCaptureSession = .{};
     session.init(allocator, null) catch |err| {
@@ -349,47 +536,17 @@ pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordS
     const start_ms = capture.CopyCaptureSession.monotonicMs();
     const deadline_ms: ?u64 = if (config.duration_secs > 0) start_ms + config.duration_secs * 1000 else null;
 
-    const init_res = initFirstFrame(
+    try runSessionPipeline(
         &session,
         &device,
         &slots,
+        config,
         deadline_ms,
         &clock,
-        config,
-        sink.needsGlobalHeader(),
-    ) catch |err| {
-        if (isGracefulStop(err)) return stats;
-        return err;
-    };
-    var filter = init_res.filter;
-    defer filter.deinit();
-    var encoder = init_res.encoder;
-    defer encoder.deinit();
-    stats.frames_captured += 1;
-
-    sink.openVideoStream(encoder.codec_ctx) catch |err| return mapMuxError(err);
-
-    {
-        var first_out = init_res.first_out;
-        defer first_out.deinit();
-        encoder.sendFrame(&first_out) catch return error.EncodeFailed;
-    }
-    try drainEncoderPackets(&encoder, &sink, &stats);
-
-    var ctx = RecordingContext{
-        .session = &session,
-        .device = &device,
-        .slots = &slots,
-        .filter = &filter,
-        .encoder = &encoder,
-        .clock = &clock,
-        .config = &config,
-        .deadline_ms = deadline_ms,
-        .sink = &sink,
-        .stats = &stats,
-    };
-    try recordLoop(&ctx);
-    try flushRecording(&encoder, &sink, &stats);
+        &sink,
+        maybe_audio,
+        &stats,
+    );
 
     return stats;
 }
@@ -422,4 +579,15 @@ test "RecordStats default values and rate control selection" {
     try std.testing.expect(isGracefulStop(capture.CaptureError.Timeout));
     try std.testing.expect(isGracefulStop(capture.CaptureError.Interrupted));
     try std.testing.expect(!isGracefulStop(capture.CaptureError.BufferConstraints));
+
+    try std.testing.expectEqual(RecordError.AudioInitFailed, mapAudioError(audio.AudioPipelineError.EncoderOpenFailed));
+    try std.testing.expectEqual(error.OutOfMemory, mapAudioError(audio.AudioPipelineError.OutOfMemory));
+
+    try std.testing.expectError(
+        RecordError.UnsupportedTarget,
+        runRecording(std.testing.allocator, .{
+            .output_path = "/tmp/wlrec-raw-reject.h264",
+            .audio_mode = .desktop,
+        }),
+    );
 }

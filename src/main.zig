@@ -8,23 +8,71 @@ pub const mux = @import("mux/lib.zig");
 pub const record = @import("record/lib.zig");
 pub const cli = @import("cli/lib.zig");
 
-fn handleRecordSubcommand(allocator: std.mem.Allocator, rec_opts: cli.args.RecordOptions, stdout: anytype) !void {
+fn audioModeLabel(mode: common.AudioSourceMode) []const u8 {
+    return switch (mode) {
+        .none => "none",
+        .desktop => "desktop",
+        .mic => "mic",
+        .both => "both",
+        .device => |name| name,
+    };
+}
+
+fn printRecordStartBanner(rec_opts: cli.args.RecordOptions, stdout: anytype) !void {
     if (rec_opts.bitrate) |br| {
-        try stdout.print("Recording screen to {s} (device: {s}, fps: {}, bitrate: {} bps)...\n", .{
+        try stdout.print("Recording screen to {s} (device: {s}, fps: {}, bitrate: {} bps", .{
             rec_opts.output_path,
             rec_opts.device_path,
             rec_opts.fps,
             br,
         });
     } else {
-        try stdout.print("Recording screen to {s} (device: {s}, fps: {}, qp: {})...\n", .{
+        try stdout.print("Recording screen to {s} (device: {s}, fps: {}, qp: {}", .{
             rec_opts.output_path,
             rec_opts.device_path,
             rec_opts.fps,
             rec_opts.qp,
         });
     }
+    if (rec_opts.audio_mode.isEnabled()) {
+        try stdout.print(", audio: {s} @ {} bps", .{
+            audioModeLabel(rec_opts.audio_mode),
+            rec_opts.audio_bitrate,
+        });
+    }
+    try stdout.writeAll(")...\n");
     try stdout.flush();
+}
+
+fn printRecordSummary(
+    rec_opts: cli.args.RecordOptions,
+    stats: record.engine.RecordStats,
+    stdout: anytype,
+) !void {
+    try stdout.print("Recording complete: {} frames captured, {} encoded, {} bytes written", .{
+        stats.frames_captured,
+        stats.frames_encoded,
+        stats.bytes_written,
+    });
+    if (rec_opts.audio_mode.isEnabled()) {
+        try stdout.print(", audio: {} frames captured, {} encoded", .{
+            stats.audio_frames_captured,
+            stats.audio_frames_encoded,
+        });
+    }
+    if (stats.packets_dropped > 0 or stats.reconnects > 0 or stats.audio_packets_dropped > 0 or stats.audio_frames_dropped > 0) {
+        try stdout.print(" ({} video/mux dropped, {} audio pkts dropped, {} pcm frames dropped, {} reconnects)", .{
+            stats.packets_dropped,
+            stats.audio_packets_dropped,
+            stats.audio_frames_dropped,
+            stats.reconnects,
+        });
+    }
+    try stdout.writeAll("\n");
+}
+
+fn handleRecordSubcommand(allocator: std.mem.Allocator, rec_opts: cli.args.RecordOptions, stdout: anytype) !void {
+    try printRecordStartBanner(rec_opts, stdout);
 
     const dev_z = try allocator.dupeSentinel(u8, rec_opts.device_path, 0);
     defer allocator.free(dev_z);
@@ -35,22 +83,13 @@ fn handleRecordSubcommand(allocator: std.mem.Allocator, rec_opts: cli.args.Recor
         .fps = rec_opts.fps,
         .qp = rec_opts.qp,
         .bitrate = rec_opts.bitrate,
+        .audio_mode = rec_opts.audio_mode,
+        .audio_bitrate = rec_opts.audio_bitrate,
         .duration_secs = rec_opts.duration_secs,
     };
 
     const stats = try record.engine.runRecording(allocator, config);
-    try stdout.print("Recording complete: {} frames captured, {} encoded, {} bytes written", .{
-        stats.frames_captured,
-        stats.frames_encoded,
-        stats.bytes_written,
-    });
-    if (stats.packets_dropped > 0 or stats.reconnects > 0) {
-        try stdout.print(" ({} packets dropped, {} reconnects)", .{
-            stats.packets_dropped,
-            stats.reconnects,
-        });
-    }
-    try stdout.writeAll("\n");
+    try printRecordSummary(rec_opts, stats, stdout);
 }
 
 fn dispatchSubcommand(allocator: std.mem.Allocator, opts: cli.args.CliOptions, stdout: anytype) !void {
