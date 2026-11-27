@@ -22,7 +22,7 @@ pub const RecordError = error{
 };
 
 pub const RecordConfig = struct {
-    output_path: []const u8,
+    output_paths: []const []const u8,
     device_path: ?[*:0]const u8 = null,
     fps: u32 = 60,
     qp: u8 = 23,
@@ -40,6 +40,8 @@ pub const RecordStats = struct {
     bytes_written: u64 = 0,
     packets_dropped: u64 = 0,
     reconnects: u64 = 0,
+    outputs_count: usize = 0,
+    outputs_failed: usize = 0,
     first_keyframe_seen: bool = false,
     audio_frames_captured: u64 = 0,
     audio_frames_encoded: u64 = 0,
@@ -59,12 +61,14 @@ pub fn selectRateControl(config: RecordConfig) common.RateControlProfile {
         const bufsize_kb = @max(@as(u32, 1), kbps / 4);
         return common.RateControlProfile.vbr(kbps, maxrate, bufsize_kb);
     }
-    if (mux.parseTarget(config.output_path)) |target| {
-        if (target.sink_type == .rtmp) {
-            return common.RateControlProfile.vbr(4500, 6750, 1125);
+    for (config.output_paths) |path| {
+        if (mux.parseTarget(path)) |target| {
+            if (target.sink_type == .rtmp) {
+                return common.RateControlProfile.vbr(4500, 6750, 1125);
+            }
+        } else |err| {
+            std.log.debug("target rate-control fallback for {s}: {s}", .{ path, @errorName(err) });
         }
-    } else |err| {
-        std.log.debug("target rate-control fallback for {s}: {s}", .{ config.output_path, @errorName(err) });
     }
     return common.RateControlProfile.cqp(config.qp);
 }
@@ -123,7 +127,7 @@ fn mapMuxError(err: mux.MuxError) (RecordError || error{OutOfMemory}) {
     };
 }
 
-fn drainEncoderPackets(encoder: *encode.VaapiEncoder, sink: *mux.MuxSink, stats: *RecordStats) !void {
+fn drainEncoderPackets(encoder: *encode.VaapiEncoder, sink: *mux.MuxFanout, stats: *RecordStats) !void {
     while (try encoder.receivePacket()) |pkt_val| {
         var pkt = pkt_val;
         defer pkt.deinit();
@@ -133,11 +137,13 @@ fn drainEncoderPackets(encoder: *encode.VaapiEncoder, sink: *mux.MuxSink, stats:
     }
 }
 
-fn syncMuxStats(sink: *const mux.MuxSink, stats: *RecordStats) void {
+fn syncMuxStats(sink: *const mux.MuxFanout, stats: *RecordStats) void {
     const m = sink.getStats();
     stats.bytes_written = m.bytes_written;
     stats.packets_dropped = m.packets_dropped;
     stats.reconnects = m.reconnects;
+    stats.outputs_count = sink.sinkCount();
+    stats.outputs_failed = sink.failedCount();
 }
 
 fn mapAudioError(err: audio.AudioPipelineError) (RecordError || error{OutOfMemory}) {
@@ -146,13 +152,13 @@ fn mapAudioError(err: audio.AudioPipelineError) (RecordError || error{OutOfMemor
 
 const AudioMuxForwarder = struct {
     pipeline: *audio.AudioPipeline,
-    sink: *mux.MuxSink,
+    sink: *mux.MuxFanout,
     stop_wake: audio.EventFd,
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     write_error: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
-    fn init(pipeline: *audio.AudioPipeline, sink: *mux.MuxSink) !AudioMuxForwarder {
+    fn init(pipeline: *audio.AudioPipeline, sink: *mux.MuxFanout) !AudioMuxForwarder {
         const stop_wake = audio.EventFd.init() catch return error.AudioInitFailed;
         return .{
             .pipeline = pipeline,
@@ -233,7 +239,7 @@ fn initAudioPipelineIfEnabled(
 
 fn flushRecording(
     encoder: *encode.VaapiEncoder,
-    sink: *mux.MuxSink,
+    sink: *mux.MuxFanout,
     maybe_audio: ?*audio.AudioPipeline,
     forwarder: *?AudioMuxForwarder,
     stats: *RecordStats,
@@ -354,7 +360,7 @@ const RecordingContext = struct {
     clock: *common.VfrClock,
     config: *const RecordConfig,
     deadline_ms: ?u64,
-    sink: *mux.MuxSink,
+    sink: *mux.MuxFanout,
     stats: *RecordStats,
 };
 
@@ -444,7 +450,7 @@ fn runSessionPipeline(
     config: RecordConfig,
     deadline_ms: ?u64,
     clock: *common.VfrClock,
-    sink: *mux.MuxSink,
+    sink: *mux.MuxFanout,
     maybe_audio: ?*audio.AudioPipeline,
     stats: *RecordStats,
 ) !void {
@@ -503,7 +509,7 @@ fn runSessionPipeline(
 pub fn runRecording(allocator: std.mem.Allocator, config: RecordConfig) !RecordStats {
     var stats = RecordStats{};
 
-    var sink = mux.MuxSink.init(allocator, config.output_path) catch |err| return mapMuxError(err);
+    var sink = mux.MuxFanout.init(allocator, config.output_paths) catch |err| return mapMuxError(err);
     defer sink.deinit();
     if (config.audio_mode.isEnabled() and !sink.supportsAudio()) {
         return error.UnsupportedTarget;
@@ -559,15 +565,24 @@ test "RecordStats default values and rate control selection" {
     try std.testing.expectEqual(@as(u64, 0), stats.reconnects);
     try std.testing.expectEqual(false, stats.first_keyframe_seen);
 
-    const cqp_rc = selectRateControl(.{ .output_path = "a.h264", .qp = 21 });
+    const cqp_rc = selectRateControl(.{ .output_paths = &.{"a.h264"}, .qp = 21 });
     try std.testing.expectEqual(common.RateControlProfile.Mode.cqp, cqp_rc.mode);
     try std.testing.expectEqual(@as(u8, 21), cqp_rc.qp);
 
-    const rtmp_rc = selectRateControl(.{ .output_path = "rtmp://127.0.0.1/live/key" });
+    const rtmp_rc = selectRateControl(.{ .output_paths = &.{"rtmp://127.0.0.1/live/key"} });
     try std.testing.expectEqual(common.RateControlProfile.Mode.vbr, rtmp_rc.mode);
     try std.testing.expectEqual(@as(u32, 4500), rtmp_rc.bitrate_kbps);
 
-    const vbr_rc = selectRateControl(.{ .output_path = "a.h264", .bitrate = 6_000_000 });
+    const mixed_rc = selectRateControl(.{
+        .output_paths = &.{ "archive.mp4", "rtmps://127.0.0.1/live/key" },
+    });
+    try std.testing.expectEqual(common.RateControlProfile.Mode.vbr, mixed_rc.mode);
+    try std.testing.expectEqual(@as(u32, 4500), mixed_rc.bitrate_kbps);
+
+    const vbr_rc = selectRateControl(.{
+        .output_paths = &.{ "archive.mp4", "rtmp://127.0.0.1/live/key" },
+        .bitrate = 6_000_000,
+    });
     try std.testing.expectEqual(common.RateControlProfile.Mode.vbr, vbr_rc.mode);
     try std.testing.expectEqual(@as(u32, 6000), vbr_rc.bitrate_kbps);
 
@@ -586,8 +601,15 @@ test "RecordStats default values and rate control selection" {
     try std.testing.expectError(
         RecordError.UnsupportedTarget,
         runRecording(std.testing.allocator, .{
-            .output_path = "/tmp/wlrec-raw-reject.h264",
+            .output_paths = &.{"/tmp/wlrec-raw-reject.h264"},
             .audio_mode = .desktop,
+        }),
+    );
+
+    try std.testing.expectError(
+        RecordError.UnsupportedTarget,
+        runRecording(std.testing.allocator, .{
+            .output_paths = &.{ "/tmp/wlrec-mix-a.h264", "/tmp/wlrec-mix-b.mp4" },
         }),
     );
 }

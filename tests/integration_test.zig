@@ -259,8 +259,9 @@ fn runLiveCaptureCase(filename: []const u8, magic_offset: usize, expected_magic:
         dmg_thread.join();
     }
 
+    const outputs = [_][]const u8{out_path_z};
     const config = record.engine.RecordConfig{
-        .output_path = out_path_z,
+        .output_paths = &outputs,
         .device_path = "/dev/dri/renderD128",
         .fps = 60,
         .qp = 23,

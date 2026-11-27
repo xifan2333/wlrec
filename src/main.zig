@@ -18,17 +18,24 @@ fn audioModeLabel(mode: common.AudioSourceMode) []const u8 {
     };
 }
 
+fn printOutputTargets(outputs: []const []const u8, stdout: anytype) !void {
+    for (outputs, 0..) |target, idx| {
+        if (idx > 0) try stdout.writeAll(", ");
+        try stdout.writeAll(target);
+    }
+}
+
 fn printRecordStartBanner(rec_opts: cli.args.RecordOptions, stdout: anytype) !void {
+    try stdout.writeAll("Recording screen to ");
+    try printOutputTargets(rec_opts.outputs(), stdout);
     if (rec_opts.bitrate) |br| {
-        try stdout.print("Recording screen to {s} (device: {s}, fps: {}, bitrate: {} bps", .{
-            rec_opts.output_path,
+        try stdout.print(" (device: {s}, fps: {}, bitrate: {} bps", .{
             rec_opts.device_path,
             rec_opts.fps,
             br,
         });
     } else {
-        try stdout.print("Recording screen to {s} (device: {s}, fps: {}, qp: {}", .{
-            rec_opts.output_path,
+        try stdout.print(" (device: {s}, fps: {}, qp: {}", .{
             rec_opts.device_path,
             rec_opts.fps,
             rec_opts.qp,
@@ -54,18 +61,24 @@ fn printRecordSummary(
         stats.frames_encoded,
         stats.bytes_written,
     });
+    if (stats.outputs_count > 1) {
+        try stdout.print(" across {} outputs", .{stats.outputs_count});
+    }
     if (rec_opts.audio_mode.isEnabled()) {
         try stdout.print(", audio: {} frames captured, {} encoded", .{
             stats.audio_frames_captured,
             stats.audio_frames_encoded,
         });
     }
-    if (stats.packets_dropped > 0 or stats.reconnects > 0 or stats.audio_packets_dropped > 0 or stats.audio_frames_dropped > 0) {
-        try stdout.print(" ({} video/mux dropped, {} audio pkts dropped, {} pcm frames dropped, {} reconnects)", .{
+    if (stats.packets_dropped > 0 or stats.reconnects > 0 or stats.outputs_failed > 0 or
+        stats.audio_packets_dropped > 0 or stats.audio_frames_dropped > 0)
+    {
+        try stdout.print(" ({} video/mux dropped, {} audio pkts dropped, {} pcm frames dropped, {} reconnects, {} outputs failed)", .{
             stats.packets_dropped,
             stats.audio_packets_dropped,
             stats.audio_frames_dropped,
             stats.reconnects,
+            stats.outputs_failed,
         });
     }
     try stdout.writeAll("\n");
@@ -78,7 +91,7 @@ fn handleRecordSubcommand(allocator: std.mem.Allocator, rec_opts: cli.args.Recor
     defer allocator.free(dev_z);
 
     const config = record.engine.RecordConfig{
-        .output_path = rec_opts.output_path,
+        .output_paths = rec_opts.outputs(),
         .device_path = dev_z.ptr,
         .fps = rec_opts.fps,
         .qp = rec_opts.qp,
