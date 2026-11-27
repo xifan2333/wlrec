@@ -9,8 +9,12 @@ pub const Subcommand = enum {
     version,
 };
 
+pub const max_output_targets: usize = 16;
+const default_outputs = [_][]const u8{"output.h264"};
+
 pub const RecordOptions = struct {
-    output_path: []const u8 = "output.h264",
+    output_paths: [max_output_targets][]const u8 = @splat(""),
+    output_count: usize = 0,
     device_path: []const u8 = "/dev/dri/renderD128",
     fps: u32 = 60,
     qp: u8 = 23,
@@ -18,6 +22,11 @@ pub const RecordOptions = struct {
     audio_mode: common.AudioSourceMode = .none,
     audio_bitrate: u32 = audio.default_bitrate_bps,
     duration_secs: u64 = 0,
+
+    pub fn outputs(self: *const RecordOptions) []const []const u8 {
+        if (self.output_count == 0) return &default_outputs;
+        return self.output_paths[0..self.output_count];
+    }
 };
 
 pub const CliOptions = struct {
@@ -31,12 +40,15 @@ pub const CliError = error{
     MissingOptionValue,
     InvalidNumber,
     InvalidAudioSource,
+    TooManyOutputs,
 };
 
 const FlagHandler = *const fn (*RecordOptions, []const u8) CliError!void;
 
 fn setOutput(opts: *RecordOptions, val: []const u8) CliError!void {
-    opts.output_path = val;
+    if (opts.output_count >= max_output_targets) return error.TooManyOutputs;
+    opts.output_paths[opts.output_count] = val;
+    opts.output_count += 1;
 }
 
 fn setDevice(opts: *RecordOptions, val: []const u8) CliError!void {
@@ -146,7 +158,7 @@ pub fn printUsage(writer: anytype) !void {
         \\  version, -v         Show version information
         \\
         \\Record Options:
-        \\  -o, --output <path>    Output file (.mp4/.mkv/.flv/.h264) or rtmp:// URL (default: output.h264)
+        \\  -o, --output <path>    Output file (.mp4/.mkv/.flv/.h264) or rtmp:// URL; repeatable (default: output.h264)
         \\  -d, --device <path>    DRM render node path (default: /dev/dri/renderD128)
         \\  -f, --fps <num>        Capture framerate (default: 60)
         \\  -q, --qp <num>          H.264 CQP quantization parameter (default: 23)
@@ -182,7 +194,8 @@ test "parseFromSlice record defaults and options" {
     const rec_default = [_][]const u8{ "wlrec", "record" };
     const d_opts = try parseFromSlice(&rec_default);
     try std.testing.expectEqual(Subcommand.record, d_opts.subcommand);
-    try std.testing.expectEqualStrings("output.h264", d_opts.record.output_path);
+    try std.testing.expectEqual(@as(usize, 1), d_opts.record.outputs().len);
+    try std.testing.expectEqualStrings("output.h264", d_opts.record.outputs()[0]);
     try std.testing.expectEqual(@as(u32, 60), d_opts.record.fps);
     try std.testing.expectEqual(@as(u8, 23), d_opts.record.qp);
     try std.testing.expectEqual(@as(?u32, null), d_opts.record.bitrate);
@@ -198,12 +211,25 @@ test "parseFromSlice record defaults and options" {
     };
     const c_opts = try parseFromSlice(&rec_custom);
     try std.testing.expectEqual(Subcommand.record, c_opts.subcommand);
-    try std.testing.expectEqualStrings("rec.h264", c_opts.record.output_path);
+    try std.testing.expectEqual(@as(usize, 1), c_opts.record.outputs().len);
+    try std.testing.expectEqualStrings("rec.h264", c_opts.record.outputs()[0]);
     try std.testing.expectEqual(@as(u32, 30), c_opts.record.fps);
     try std.testing.expectEqual(@as(u8, 18), c_opts.record.qp);
     try std.testing.expectEqual(@as(?u32, 8_000_000), c_opts.record.bitrate);
     try std.testing.expectEqual(@as(u64, 10), c_opts.record.duration_secs);
     try std.testing.expectEqualStrings("/dev/dri/renderD129", c_opts.record.device_path);
+
+    const rec_multi = [_][]const u8{
+        "wlrec",    "record",
+        "-o",       "archive.mp4",
+        "--output", "rtmp://live.a.test/app/key1",
+        "-o",       "rtmp://live.b.test/app/key2",
+    };
+    const m_opts = try parseFromSlice(&rec_multi);
+    try std.testing.expectEqual(@as(usize, 3), m_opts.record.outputs().len);
+    try std.testing.expectEqualStrings("archive.mp4", m_opts.record.outputs()[0]);
+    try std.testing.expectEqualStrings("rtmp://live.a.test/app/key1", m_opts.record.outputs()[1]);
+    try std.testing.expectEqualStrings("rtmp://live.b.test/app/key2", m_opts.record.outputs()[2]);
 
     const cqp_override = [_][]const u8{ "wlrec", "record", "-b", "8000000", "-q", "20" };
     const q_opts = try parseFromSlice(&cqp_override);
@@ -232,6 +258,15 @@ test "parseFromSlice error handling" {
 
     const bad_abr = [_][]const u8{ "wlrec", "record", "--audio-bitrate", "8000" };
     try std.testing.expectError(error.InvalidNumber, parseFromSlice(&bad_abr));
+
+    var overflow_args: [2 + (max_output_targets + 1) * 2][]const u8 = undefined;
+    overflow_args[0] = "wlrec";
+    overflow_args[1] = "record";
+    for (0..max_output_targets + 1) |i| {
+        overflow_args[2 + i * 2] = "-o";
+        overflow_args[2 + i * 2 + 1] = "out.mp4";
+    }
+    try std.testing.expectError(error.TooManyOutputs, parseFromSlice(&overflow_args));
 }
 
 test "parseFromSlice audio options" {

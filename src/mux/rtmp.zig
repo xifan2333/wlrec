@@ -250,9 +250,13 @@ pub const RtmpWorker = struct {
         };
     }
 
-    pub fn stopAndJoin(self: *RtmpWorker) void {
+    pub fn requestStop(self: *RtmpWorker) void {
         self.stop_requested.store(true, .release);
         self.signalWake();
+    }
+
+    pub fn stopAndJoin(self: *RtmpWorker) void {
+        self.requestStop();
         if (self.thread) |t| {
             t.join();
             self.thread = null;

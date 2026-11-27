@@ -221,20 +221,36 @@ fn runDamageGenerator(tctx: *ThreadCtx) void {
     pumpFrames(client.display.?, surf, &slots, pixels, tctx);
 }
 
-fn runLiveCaptureCase(filename: []const u8, magic_offset: usize, expected_magic: []const u8) !void {
+fn captureEnvAvailable() bool {
     const dpy = c.wl_display_connect(null);
     if (dpy == null) {
         std.log.info("SKIPPED: No Wayland display available in test environment", .{});
-        return;
+        return false;
     }
     c.wl_display_disconnect(dpy);
 
     const drm_fd = c.open("/dev/dri/renderD128", c.O_RDWR);
     if (drm_fd < 0) {
         std.log.info("SKIPPED: /dev/dri/renderD128 not accessible", .{});
-        return;
+        return false;
     }
     _ = c.close(drm_fd);
+    return true;
+}
+
+fn checkMagicAt(path_z: [*:0]const u8, magic_offset: usize, expected_magic: []const u8) !void {
+    const fd = c.open(path_z, c.O_RDONLY);
+    try std.testing.expect(fd >= 0);
+    defer _ = c.close(fd);
+
+    var header: [8]u8 = undefined;
+    const n = c.read(fd, &header[0], 8);
+    try std.testing.expectEqual(@as(isize, 8), n);
+    try std.testing.expectEqualSlices(u8, expected_magic, header[magic_offset .. magic_offset + expected_magic.len]);
+}
+
+fn runLiveCaptureCase(filename: []const u8, magic_offset: usize, expected_magic: []const u8) !void {
+    if (!captureEnvAvailable()) return;
 
     var dir_tpl = "/tmp/wlrec-test-XXXXXX".*;
     const dir_ptr = c.mkdtemp(&dir_tpl[0]) orelse return error.TempDirFailed;
@@ -259,8 +275,9 @@ fn runLiveCaptureCase(filename: []const u8, magic_offset: usize, expected_magic:
         dmg_thread.join();
     }
 
+    const outputs = [_][]const u8{out_path_z};
     const config = record.engine.RecordConfig{
-        .output_path = out_path_z,
+        .output_paths = &outputs,
         .device_path = "/dev/dri/renderD128",
         .fps = 60,
         .qp = 23,
@@ -277,14 +294,67 @@ fn runLiveCaptureCase(filename: []const u8, magic_offset: usize, expected_magic:
     try std.testing.expectEqual(@as(u64, 0), stats.packets_dropped);
     try std.testing.expect(stats.first_keyframe_seen);
 
-    const check_fd = c.open(out_path_z.ptr, c.O_RDONLY);
-    try std.testing.expect(check_fd >= 0);
-    defer _ = c.close(check_fd);
+    try checkMagicAt(out_path_z.ptr, magic_offset, expected_magic);
+}
 
-    var header: [8]u8 = undefined;
-    const n = c.read(check_fd, &header[0], 8);
-    try std.testing.expectEqual(@as(isize, 8), n);
-    try std.testing.expectEqualSlices(u8, expected_magic, header[magic_offset .. magic_offset + expected_magic.len]);
+/// One encode session fanning out to a local container backup plus an unreachable
+/// RTMP endpoint: the archive must stay valid while the stalled RTMP sink is isolated.
+fn runMultiOutputFanoutCase() !void {
+    if (!captureEnvAvailable()) return;
+
+    var dir_tpl = "/tmp/wlrec-fanout-e2e-XXXXXX".*;
+    const dir_ptr = c.mkdtemp(&dir_tpl[0]) orelse return error.TempDirFailed;
+    const dir_slice = std.mem.span(dir_ptr);
+
+    var mp4_buf: [128]u8 = undefined;
+    const mp4_slice = try std.fmt.bufPrint(mp4_buf[0 .. mp4_buf.len - 1], "{s}/archive.mp4", .{dir_slice});
+    mp4_buf[mp4_slice.len] = 0;
+    const mp4_z = mp4_buf[0..mp4_slice.len :0];
+
+    var mkv_buf: [128]u8 = undefined;
+    const mkv_slice = try std.fmt.bufPrint(mkv_buf[0 .. mkv_buf.len - 1], "{s}/backup.mkv", .{dir_slice});
+    mkv_buf[mkv_slice.len] = 0;
+    const mkv_z = mkv_buf[0..mkv_slice.len :0];
+
+    defer {
+        _ = c.unlink(mp4_z.ptr);
+        _ = c.unlink(mkv_z.ptr);
+        _ = c.rmdir(dir_ptr);
+    }
+
+    const stop_fd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
+    try std.testing.expect(stop_fd >= 0);
+    defer _ = c.close(stop_fd);
+
+    var tctx = ThreadCtx{ .stop_fd = stop_fd };
+    const dmg_thread = try std.Thread.spawn(.{}, runDamageGenerator, .{&tctx});
+    defer {
+        tctx.stop.store(true, .release);
+        dmg_thread.join();
+    }
+
+    const outputs = [_][]const u8{ mp4_slice, mkv_slice, "rtmp://127.0.0.1:19361/live/fanout-e2e" };
+    const config = record.engine.RecordConfig{
+        .output_paths = &outputs,
+        .device_path = "/dev/dri/renderD128",
+        .fps = 60,
+        .qp = 23,
+        .max_frames = 5,
+        .duration_secs = 5,
+        .stop_fd = stop_fd,
+    };
+
+    const stats = try record.engine.runRecording(std.testing.allocator, config);
+
+    try std.testing.expectEqual(@as(usize, 3), stats.outputs_count);
+    try std.testing.expect(stats.frames_encoded >= 5);
+    try std.testing.expect(stats.first_keyframe_seen);
+    // Archive bytes survive even though the RTMP sibling cannot deliver packets.
+    try std.testing.expect(stats.bytes_written > 1000);
+    try std.testing.expect(stats.packets_dropped >= 1);
+
+    try checkMagicAt(mp4_z.ptr, 4, "ftyp");
+    try checkMagicAt(mkv_z.ptr, 0, &[_]u8{ 0x1a, 0x45, 0xdf, 0xa3 });
 }
 
 test "live desktop zero-copy capture to h264 file" {
@@ -293,4 +363,8 @@ test "live desktop zero-copy capture to h264 file" {
 
 test "live desktop zero-copy capture to mp4 container" {
     try runLiveCaptureCase("burst.mp4", 4, "ftyp");
+}
+
+test "live desktop multi-output fan-out to container and rtmp" {
+    try runMultiOutputFanoutCase();
 }
