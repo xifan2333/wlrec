@@ -191,35 +191,12 @@ pub const MuxFanout = struct {
 };
 
 fn sendFanoutVideoBatch(fanout: *MuxFanout) !void {
-    const idr_slice_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0 };
-    for ([_]i64{ 0, 33, 100 }, 0..) |pts, idx| {
-        const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
-        var pkt_opt: ?*c.AVPacket = pkt;
-        defer c.av_packet_free(&pkt_opt);
-        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(pkt, idr_slice_bytes.len));
-        @memcpy(pkt.*.data[0..idr_slice_bytes.len], &idr_slice_bytes);
-        pkt.*.pts = pts;
-        pkt.*.dts = pts;
-        pkt.*.duration = 33;
-        if (idx == 0) pkt.*.flags |= c.AV_PKT_FLAG_KEY;
-        try fanout.writeVideoPacket(pkt);
-    }
+    try sink.sendTestBatch(fanout, true, &sink.test_video_specs);
 }
 
 fn sendFanoutAudioBatch(fanout: *MuxFanout) !void {
-    const aac_frame_bytes = [_]u8{ 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c };
-    for (0..6) |idx| {
-        const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
-        var pkt_opt: ?*c.AVPacket = pkt;
-        defer c.av_packet_free(&pkt_opt);
-        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(pkt, aac_frame_bytes.len));
-        @memcpy(pkt.*.data[0..aac_frame_bytes.len], &aac_frame_bytes);
-        const sample_pts: i64 = @as(i64, @intCast(idx)) * 1024;
-        pkt.*.pts = sample_pts;
-        pkt.*.dts = sample_pts;
-        pkt.*.duration = 1024;
-        try fanout.writeAudioPacket(pkt);
-    }
+    const specs = sink.testAudioSpecs(0);
+    try sink.sendTestBatch(fanout, false, &specs);
 }
 
 test "MuxFanout validates empty, duplicate, and incompatible header combinations" {

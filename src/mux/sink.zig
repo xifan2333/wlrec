@@ -386,36 +386,68 @@ pub fn allocTestAacContext() !*c.AVCodecContext {
     return ctx;
 }
 
-fn sendTestVideoBatch(sink_ptr: *MuxSink) !void {
-    const idr_slice_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0 };
-    for ([_]i64{ 0, 33, 100 }, 0..) |pts, idx| {
-        const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
-        var pkt_opt: ?*c.AVPacket = pkt;
-        defer c.av_packet_free(&pkt_opt);
-        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(pkt, idr_slice_bytes.len));
-        @memcpy(pkt.*.data[0..idr_slice_bytes.len], &idr_slice_bytes);
-        pkt.*.pts = pts;
-        pkt.*.dts = pts;
-        pkt.*.duration = 33;
-        if (idx == 0) pkt.*.flags |= c.AV_PKT_FLAG_KEY;
-        try sink_ptr.writeVideoPacket(pkt);
+/// Synthetic encoded packet reused by every mux test fixture.
+pub const TestPacketSpec = struct {
+    data: []const u8,
+    pts: i64,
+    duration: i64,
+    key: bool = false,
+};
+
+const test_idr_slice = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0 };
+const test_aac_frame = [_]u8{ 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c };
+
+/// Three synthetic H.264 access units, the first carrying the keyframe flag.
+pub const test_video_specs = [_]TestPacketSpec{
+    .{ .data = &test_idr_slice, .pts = 0, .duration = 33, .key = true },
+    .{ .data = &test_idr_slice, .pts = 33, .duration = 33 },
+    .{ .data = &test_idr_slice, .pts = 100, .duration = 33 },
+};
+
+/// Six synthetic AAC frames of 1024 samples starting at `start_pts`.
+pub fn testAudioSpecs(start_pts: i64) [6]TestPacketSpec {
+    var specs: [6]TestPacketSpec = undefined;
+    for (&specs, 0..) |*spec, idx| {
+        spec.* = .{
+            .data = &test_aac_frame,
+            .pts = start_pts + @as(i64, @intCast(idx)) * 1024,
+            .duration = 1024,
+        };
+    }
+    return specs;
+}
+
+/// Build one synthetic packet from `spec`; the caller owns it and frees it with `av_packet_free`.
+pub fn buildTestPacket(spec: TestPacketSpec) !*c.AVPacket {
+    const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
+    var holder: ?*c.AVPacket = pkt;
+    errdefer c.av_packet_free(&holder);
+    try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(pkt, @intCast(spec.data.len)));
+    @memcpy(pkt.*.data[0..spec.data.len], spec.data);
+    pkt.*.pts = spec.pts;
+    pkt.*.dts = spec.pts;
+    pkt.*.duration = spec.duration;
+    if (spec.key) pkt.*.flags |= c.AV_PKT_FLAG_KEY;
+    return pkt;
+}
+
+/// Write `specs` to any sink-shaped destination exposing `writeVideoPacket`/`writeAudioPacket`.
+pub fn sendTestBatch(dst: anytype, comptime is_video: bool, specs: []const TestPacketSpec) !void {
+    for (specs) |spec| {
+        const pkt = try buildTestPacket(spec);
+        var holder: ?*c.AVPacket = pkt;
+        defer c.av_packet_free(&holder);
+        if (is_video) try dst.writeVideoPacket(pkt) else try dst.writeAudioPacket(pkt);
     }
 }
 
+fn sendTestVideoBatch(sink_ptr: *MuxSink) !void {
+    try sendTestBatch(sink_ptr, true, &test_video_specs);
+}
+
 fn sendTestAudioBatch(sink_ptr: *MuxSink) !void {
-    const aac_frame_bytes = [_]u8{ 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c };
-    for (0..6) |idx| {
-        const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
-        var pkt_opt: ?*c.AVPacket = pkt;
-        defer c.av_packet_free(&pkt_opt);
-        try std.testing.expectEqual(@as(c_int, 0), c.av_new_packet(pkt, aac_frame_bytes.len));
-        @memcpy(pkt.*.data[0..aac_frame_bytes.len], &aac_frame_bytes);
-        const sample_pts: i64 = @as(i64, @intCast(idx)) * 1024 - 1024;
-        pkt.*.pts = sample_pts;
-        pkt.*.dts = sample_pts;
-        pkt.*.duration = 1024;
-        try sink_ptr.writeAudioPacket(pkt);
-    }
+    const specs = testAudioSpecs(-1024);
+    try sendTestBatch(sink_ptr, false, &specs);
 }
 
 test "MuxSink supportsAudio rejects raw h264 with audio and muxes concurrent A/V streams" {
