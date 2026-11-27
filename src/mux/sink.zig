@@ -115,6 +115,18 @@ pub const MuxSink = struct {
         };
     }
 
+    /// Return true when this sink targets a live RTMP/RTMPS endpoint.
+    pub fn isRtmp(self: *const MuxSink) bool {
+        return self.target_info.sink_type == .rtmp;
+    }
+
+    /// Signal an asynchronous RTMP worker to stop without blocking on join.
+    pub fn requestStop(self: *MuxSink) void {
+        if (self.rtmp_worker) |worker| {
+            worker.requestStop();
+        }
+    }
+
     /// Return true when the container supports an audio track alongside video.
     pub fn supportsAudio(self: *const MuxSink) bool {
         return !std.mem.eql(u8, self.target_info.format_name, "h264");
